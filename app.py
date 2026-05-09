@@ -1,12 +1,19 @@
 """Streamlit 交互界面: 上传输入 -> 自动/人工核对分类 -> 下载输出 -> 增量训练.
 
 启动: streamlit run app.py
+
+部署 (Streamlit Community Cloud):
+    见 DEPLOY.md
 """
 from __future__ import annotations
 
+import importlib
 import io
 import json
+import os
 import shutil
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +33,14 @@ from hazard_pipeline.semi_supervised import (load_pseudo_labels,
                                                 self_train_pipeline)
 from hazard_pipeline.train import (DEFAULT_MODEL_DIR, ENHANCED_MODEL_DIR,
                                      train_pipeline)
+
+
+# 仓库自带的 5 个原始输入 (用于「使用工作区默认文件」与自训练默认输入)
+DEFAULT_WORKSPACE_INPUTS = [
+    "监控巡查情况.xlsx", "巡查信息.xlsx", "统一日常值班报告.xlsx",
+    "每日巡查报告.xlsx", "隐患排查.xlsx",
+]
+DEFAULT_GOLD = "跑冒滴漏与静电风险专项跟踪.xlsx"
 
 # ---------- 页面配置 ----------
 st.set_page_config(page_title="跑冒滴漏与静电风险隐患分类", layout="wide")
@@ -61,6 +76,80 @@ def reset_model_cache():
     load_model_cached.clear()
 
 
+def _model_trained(variant: str) -> bool:
+    p = VARIANT_DIRS[variant] / "hazard" / "meta.json"
+    return p.exists()
+
+
+def bootstrap_default_model():
+    """Streamlit Cloud 部署后第一次启动时, 模型还没训过.
+    自动训一个 standard 模型让用户可以立刻用上.
+    """
+    if _model_trained("standard"):
+        return False
+    if not Path(DEFAULT_GOLD).exists():
+        return False
+    with st.spinner(f"首次启动: 自动训练标准模型 (~30 秒)..."):
+        train_pipeline(variant="standard", model_dir=DEFAULT_MODEL_DIR)
+    reset_model_cache()
+    return True
+
+
+def has_enhanced_deps() -> bool:
+    """检查 sentence-transformers 与 torch 是否都已可用."""
+    try:
+        importlib.import_module("sentence_transformers")
+        importlib.import_module("torch")
+        return True
+    except Exception:
+        return False
+
+
+def install_enhanced_deps() -> tuple[bool, str]:
+    """运行时安装 torch (cpu) + sentence-transformers."""
+    logs = []
+    # 先装 cpu 版 torch (节省 600MB)
+    cmd1 = [sys.executable, "-m", "pip", "install",
+            "--quiet", "--no-cache-dir",
+            "--index-url", "https://download.pytorch.org/whl/cpu",
+            "torch"]
+    p1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=900)
+    logs.append("[torch] " + (p1.stdout or "") + (p1.stderr or ""))
+    if p1.returncode != 0:
+        return False, "\n".join(logs)
+    cmd2 = [sys.executable, "-m", "pip", "install",
+            "--quiet", "--no-cache-dir", "sentence-transformers"]
+    p2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=900)
+    logs.append("[sentence-transformers] " + (p2.stdout or "") + (p2.stderr or ""))
+    if p2.returncode != 0:
+        return False, "\n".join(logs)
+    importlib.invalidate_caches()
+    return True, "\n".join(logs)
+
+
+def parse_uploaded_train_xlsx(uploaded_files) -> pd.DataFrame:
+    """解析用户上传的标注 xlsx, 提取 [事件描述, 隐患类型, 分类] 三列."""
+    rows = []
+    for uf in uploaded_files:
+        try:
+            df = pd.read_excel(uf)
+        except Exception:
+            continue
+        if "事件描述" not in df.columns or "隐患类型" not in df.columns:
+            continue
+        df = df.dropna(subset=["事件描述", "隐患类型"]).copy()
+        if "分类" not in df.columns:
+            df["分类"] = "其他"
+        df["分类"] = df["分类"].fillna("其他").astype(str)
+        for _, r in df.iterrows():
+            rows.append({
+                "事件描述": str(r["事件描述"]),
+                "隐患类型": str(r["隐患类型"]),
+                "分类": str(r["分类"]),
+            })
+    return pd.DataFrame(rows)
+
+
 def save_uploads(uploaded_files) -> list:
     """把上传到 streamlit 的文件落到磁盘并返回路径列表."""
     paths = []
@@ -83,6 +172,12 @@ if "human_corrections" not in st.session_state:
     st.session_state.human_corrections = {}  # {row_index: {隐患类型, 分类}}
 if "uploaded_paths" not in st.session_state:
     st.session_state.uploaded_paths = []
+if "bootstrapped" not in st.session_state:
+    # 首次启动时自动训练标准模型 (Streamlit Cloud 部署友好)
+    if bootstrap_default_model():
+        st.session_state.bootstrapped = "standard 已自动训练"
+    else:
+        st.session_state.bootstrapped = "skip"
 
 
 # ---------- 侧栏 ----------
@@ -187,6 +282,118 @@ with col_a:
 
 with col_b:
     run_btn = st.button("🚀 汇总并分类", type="primary", use_container_width=True)
+
+# ---------- 主区: 模型管理 (折叠) ----------
+with st.expander("🛠 模型管理 (训练 / 安装加强模型 / 上传新训练集)", expanded=False):
+    st.write("**当前模型状态**")
+    cols_m = st.columns(2)
+    with cols_m[0]:
+        st.write(f"`standard`: " + ("✅ 已训练" if _model_trained("standard") else "❌ 未训练"))
+        if not _model_trained("standard"):
+            if st.button("🧠 训练标准模型", key="train_std"):
+                with st.spinner("训练 standard 模型..."):
+                    train_pipeline(variant="standard", model_dir=DEFAULT_MODEL_DIR)
+                reset_model_cache()
+                st.success("完成. 请刷新页面.")
+    with cols_m[1]:
+        deps_ok = has_enhanced_deps()
+        enh_trained = _model_trained("enhanced")
+        st.write(f"`enhanced` 依赖 (torch + sentence-transformers): "
+                  + ("✅ 已安装" if deps_ok else "❌ 未安装"))
+        st.write(f"`enhanced` 模型: " + ("✅ 已训练" if enh_trained else "❌ 未训练"))
+        if not deps_ok:
+            if st.button("📦 安装加强模型依赖 (~3-5 分钟, 一次性)",
+                          key="install_enh"):
+                with st.spinner("安装 torch (cpu) + sentence-transformers ..."):
+                    ok, log = install_enhanced_deps()
+                if ok:
+                    st.success("依赖安装完成. 请点击页面右上角的 ⋮ → Rerun, 或按 R 键.")
+                    st.code(log[-800:] if log else "", language="bash")
+                else:
+                    st.error("安装失败. 部分日志:")
+                    st.code(log[-2000:] if log else "", language="bash")
+                    st.info(
+                        "如果在 Streamlit Cloud 上无法运行时安装, 可改在 "
+                        "`requirements.txt` 中取消 `sentence-transformers` 与 `torch` "
+                        "两行的注释, 重新部署即可."
+                    )
+        else:
+            label = "🧠 训练加强模型 (~2 分钟)" if not enh_trained else "🔁 重训加强模型"
+            if st.button(label, key="train_enh"):
+                with st.spinner("训练 enhanced 模型 (会下载 SBERT 权重 ~120MB)..."):
+                    train_pipeline(variant="enhanced", model_dir=ENHANCED_MODEL_DIR)
+                reset_model_cache()
+                st.success("加强模型训练完成. 请在侧栏切换为 enhanced.")
+
+    st.divider()
+    st.write("**📤 上传新训练数据 (与原训练集合并后重训)**")
+    st.caption(
+        "上传任意数量的 Excel, 文件需包含列 `事件描述` 与 `隐患类型` (可选 `分类`). "
+        "上传后会写入人工反馈库 (data/feedback/labels.parquet), "
+        "重训时与原始 `跑冒滴漏与静电风险专项跟踪.xlsx` + 已有反馈合并 (按事件描述去重, 反馈优先)."
+    )
+    upl_train = st.file_uploader(
+        "选择训练数据 Excel", type=["xlsx", "xls"],
+        accept_multiple_files=True, key="train_upload",
+    )
+    train_variant_target = st.radio(
+        "重训目标",
+        options=[v for v in ["standard", "enhanced"]
+                 if v == "standard" or has_enhanced_deps()],
+        horizontal=True, key="retrain_variant_target",
+        help="enhanced 只有在依赖已安装后才会出现",
+    )
+    if upl_train and st.button("🔁 合并并重训", key="merge_retrain"):
+        new_df = parse_uploaded_train_xlsx(upl_train)
+        if not len(new_df):
+            st.error("没有解析到有效数据 (需含 `事件描述` + `隐患类型` 两列)")
+        else:
+            st.info(f"解析到 {len(new_df)} 条新标注. 写入反馈库 ...")
+            with st.expander("查看新标注隐患分布"):
+                st.write(new_df["隐患类型"].value_counts())
+            n = append_feedback(
+                new_df.assign(source="uploaded_train").to_dict("records"),
+                DEFAULT_FB_PATH,
+            )
+            st.success(f"已写入 {n} 条到 {DEFAULT_FB_PATH}.")
+            target_dir = VARIANT_DIRS[train_variant_target]
+            with st.spinner(f"用合并数据重训 {train_variant_target} ..."):
+                metrics = train_pipeline(
+                    variant=train_variant_target, model_dir=target_dir,
+                    pseudo_path=(PSEUDO_PATH if PSEUDO_PATH.exists() else None),
+                )
+            reset_model_cache()
+            st.success("重训完成 ✅")
+            st.json({k: v for k, v in metrics.items()
+                      if k in {"hazard_accuracy", "hazard_macro_f1",
+                               "分类_overall_accuracy", "n_train", "n_test"}})
+
+    st.divider()
+    st.write("**🌱 半监督自训练 (用工作区默认 5 输入打伪标签 + 重训)**")
+    st.caption("基于当前模型对仓库自带 5 个原始 xlsx 打高置信伪标签, 然后合并重训当前选中的变体.")
+    if st.button("🌱 一键自训练 (打伪标签 + 重训)", key="self_train_btn",
+                  disabled=(model is None)):
+        existing = [p for p in DEFAULT_WORKSPACE_INPUTS if Path(p).exists()]
+        if not existing:
+            st.error("仓库根目录未找到默认输入文件")
+        else:
+            with st.spinner("打伪标签..."):
+                info = self_train_pipeline(
+                    existing, model,
+                    pseudo_path=PSEUDO_PATH, use_rules=True,
+                )
+            st.success(
+                f"伪标签生成: {info['n_confident']} / {info['n_total']} 条 "
+                f"(类型分布: {info['by_hazard']})"
+            )
+            with st.spinner(f"用伪标签重训 {variant_choice} ..."):
+                train_pipeline(
+                    variant=variant_choice, model_dir=Path(model_dir),
+                    pseudo_path=PSEUDO_PATH,
+                )
+            reset_model_cache()
+            st.success("重训完成 ✅. 请刷新页面看新指标.")
+
 
 if run_btn:
     if model is None:
