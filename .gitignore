@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# 模型工件 (大文件, 重训可生成)
+models/
+
+# 运行时数据
+data/uploads/
+data/outputs/
+data/feedback/
+
+# Streamlit cache
+.streamlit/
