@@ -44,19 +44,49 @@ pip install -r requirements.txt
 ### 1. 训练初始模型
 
 ```bash
-python scripts/train_initial.py
+# 标准模型 (TF-IDF + LR/SVC)
+python scripts/train_initial.py --variant standard
+
+# 加强模型 (TF-IDF + 中文 SBERT 拼接)
+python scripts/train_initial.py --variant enhanced
+
+# 加强模型 + 已有伪标签
+python scripts/train_initial.py --variant enhanced --pseudo data/feedback/pseudo_labels.parquet
 ```
 
-会读取仓库根目录的 `跑冒滴漏与静电风险专项跟踪.xlsx`,
-做 90/10 stratified split, 输出指标到控制台 + `models/current/metrics.json`.
+会读取仓库根目录的 `跑冒滴漏与静电风险专项跟踪.xlsx`, 做 90/10 stratified split,
+模型保存到 `models/current/` (standard) 或 `models/enhanced/`,
+指标到 `<model_dir>/metrics.json`.
+
+### 1.5 半监督自训练 (可选, 持续优化)
+
+```bash
+# 用当前模型 对原始 5 输入 (任意未标注 Excel) 打伪标签 + 重训
+python scripts/self_train.py \
+  --inputs 监控巡查情况.xlsx 巡查信息.xlsx 统一日常值班报告.xlsx \
+           每日巡查报告.xlsx 隐患排查.xlsx \
+  --variant enhanced --haz_conf 0.90 --sub_conf 0.80 --retrain
+```
+
+伪标签独立保存在 `data/feedback/pseudo_labels.parquet`, 与人工反馈独立管理.
+重训时优先级: 人工反馈 > 真实标注 > 伪标签 (同事件描述去重).
 
 ### 2. 命令行批处理 (5 个文件 → 1 个 Excel)
 
 ```bash
+# 标准模型
 python scripts/run_pipeline.py \
   监控巡查情况.xlsx 巡查信息.xlsx 统一日常值班报告.xlsx \
   每日巡查报告.xlsx 隐患排查.xlsx \
-  -o data/outputs/跑冒滴漏与静电风险专项跟踪_输出.xlsx
+  --variant standard \
+  -o data/outputs/输出_standard.xlsx
+
+# 加强模型
+python scripts/run_pipeline.py \
+  监控巡查情况.xlsx 巡查信息.xlsx 统一日常值班报告.xlsx \
+  每日巡查报告.xlsx 隐患排查.xlsx \
+  --variant enhanced \
+  -o data/outputs/输出_enhanced.xlsx
 ```
 
 输出 Excel 列与 `跑冒滴漏与静电风险专项跟踪.xlsx` 完全一致 (16 列):
@@ -109,15 +139,35 @@ streamlit run app.py
 
 UI 可即时切换模式. 严格模式会增加 FP, 平衡模式会增加少量正类漏检.
 
-## 已实测指标 (10% test, 618 条)
+## 模型变体 (Standard / Enhanced) + 半监督
 
-| 指标 | balanced | strict |
-|---|---|---|
-| 隐患类型 accuracy | 90.5% | 53% |
-| 隐患 macro F1 | 0.80 | 0.49 |
-| 正类→其他 错分率 | 14.7% | 0.78% |
-| 其他→正类 错分数 | 38 | ~290 |
-| 分类 overall accuracy | 84.3% | — |
+系统支持两种模型变体, 在 CLI 与 Streamlit UI 都可一键切换:
+
+| 变体 | 训练 / 推理特征 | 训练时间 | 模型大小 | holdout hazard acc |
+|---|---|---|---|---|
+| `standard` | jieba 词 + 字符 ngram TF-IDF | <30s | ~10MB | 90.5% |
+| `enhanced` | TF-IDF + 中文 SBERT (paraphrase-multilingual-MiniLM-L12-v2) 拼接 | ~2min | ~150MB + SBERT 缓存 | 91.3% |
+
+`+ 半监督 (--pseudo)` : 用当前模型对未标注的原始 5 输入打高置信伪标签 (haz_top1≥0.92 且 sub_top1≥0.85), 仅加入 train (test 严格不污染), 再训练.
+
+### 第四周对比 (2468 条匹配)
+
+| 模型 | 任一错 | review 总数 | review 覆盖率 |
+|---|---|---|---|
+| standard | 154 | 522 | 97.4% |
+| **standard + pseudo** | **151** | **415** ↓ 21% | 95.4% |
+| **enhanced + pseudo** | **148** | 418 | 96.6% |
+
+### 10% holdout 实测指标 (n=586)
+
+| 模型 | hazard acc | 正类→其他 | 其他→正类 | 分类 acc |
+|---|---|---|---|---|
+| standard | 90.5% | 14.7% | 38 | 84.1% |
+| standard+pseudo | 91.3% | 16.4% | 28 | 84.8% |
+| enhanced | 91.3% | 19.5% | **24** | 85.0% |
+| enhanced+pseudo | 91.0% | 15.6% | 31 | 84.5% |
+
+> 阈值模式: `balanced` (默认) 最优整体准确率, `strict` (正类→其他<1%, 牺牲整体准确率).
 
 > 注: 训练数据中 127 条同文本对应不同标签, 5.2% "其他" 文本含强正向关键词 — 数据
 > 本身存在显著标注噪声, 因此「正类→其他<1% 且 其他→正类<5%」 在数据层面不可同时严格满足.

@@ -8,3 +8,7 @@ openpyxl>=3.1
 xlsxwriter>=3.2
 streamlit>=1.30
 regex>=2024.4
+
+# 加强模型可选依赖 (用 --variant enhanced 时需要)
+sentence-transformers>=2.2
+torch>=2.0

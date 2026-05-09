@@ -19,10 +19,13 @@ from hazard_pipeline.classifier import FullClassifier
 from hazard_pipeline.excel_writer import write_output
 from hazard_pipeline.feedback import (DEFAULT_FB_PATH, append_feedback,
                                        feedback_summary)
-from hazard_pipeline.predict import predict_dataframe
+from hazard_pipeline.predict import load_model_auto, predict_dataframe
 from hazard_pipeline.schema import (HAZARD_TYPES, OTHER_LABEL, OUTPUT_COLUMNS,
                                      POSITIVE_TYPES)
-from hazard_pipeline.train import train_pipeline
+from hazard_pipeline.semi_supervised import (load_pseudo_labels,
+                                                self_train_pipeline)
+from hazard_pipeline.train import (DEFAULT_MODEL_DIR, ENHANCED_MODEL_DIR,
+                                     train_pipeline)
 
 # ---------- 页面配置 ----------
 st.set_page_config(page_title="跑冒滴漏与静电风险隐患分类", layout="wide")
@@ -30,23 +33,32 @@ st.set_page_config(page_title="跑冒滴漏与静电风险隐患分类", layout=
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
-MODEL_DIR = Path("models/current")
+PSEUDO_PATH = DATA_DIR / "feedback" / "pseudo_labels.parquet"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+VARIANT_DIRS = {
+    "standard": DEFAULT_MODEL_DIR,
+    "enhanced": ENHANCED_MODEL_DIR,
+}
+VARIANT_LABELS = {
+    "standard": "标准模型 (TF-IDF + LR/SVC, 快, 100MB)",
+    "enhanced": "加强模型 (TF-IDF + 中文 SBERT 拼接, 略慢, ~150MB)",
+}
 
 
 # ---------- 工具函数 ----------
 
 @st.cache_resource(show_spinner=False)
-def load_model(model_dir: str = str(MODEL_DIR)):
+def load_model_cached(model_dir: str):
     p = Path(model_dir)
     if not p.exists():
         return None
-    return FullClassifier.load(p)
+    return load_model_auto(p)
 
 
 def reset_model_cache():
-    load_model.clear()
+    load_model_cached.clear()
 
 
 def save_uploads(uploaded_files) -> list:
@@ -76,10 +88,24 @@ if "uploaded_paths" not in st.session_state:
 # ---------- 侧栏 ----------
 with st.sidebar:
     st.header("⚙️ 设置")
-    model = load_model()
+
+    st.subheader("🧠 模型变体")
+    variant_choice = st.radio(
+        "选择模型",
+        options=["standard", "enhanced"],
+        format_func=lambda v: VARIANT_LABELS[v],
+        help="加强模型用 sentence-transformer 中文 embedding + TF-IDF 拼接, "
+             "在 holdout 上 其他→正类 错误更少, 但推理速度略慢.",
+    )
+    model_dir = str(VARIANT_DIRS[variant_choice])
+    model = load_model_cached(model_dir)
     if model is None:
-        st.error("模型未训练. 请先运行: `python scripts/train_initial.py` 或在下方训练.")
+        st.error(
+            f"模型 ({variant_choice}) 未训练. 请先运行:\n"
+            f"`python scripts/train_initial.py --variant {variant_choice}`"
+        )
     else:
+        st.success(f"已加载: {variant_choice}")
         modes = list(model.hazard.threshold_modes.keys()) if model.hazard.threshold_modes else ["default"]
         default_idx = modes.index(model.hazard.default_mode) if model.hazard.default_mode in modes else 0
         chosen_mode = st.selectbox("阈值模式 (隐患类型)",
@@ -108,14 +134,42 @@ with st.sidebar:
     st.caption(f"已积累人工标签: {fb['count']} 条")
     if fb["count"]:
         st.caption(f"按隐患类型: {fb.get('by_hazard', {})}")
+    ps = load_pseudo_labels(PSEUDO_PATH)
+    n_pseudo = len(ps) if ps is not None else 0
+    st.caption(f"伪标签数: {n_pseudo} 条")
 
     st.divider()
-    if st.button("🔁 用最新反馈重训模型", use_container_width=True):
+    use_pseudo = st.checkbox("重训时合并伪标签 (半监督)", value=(n_pseudo > 0),
+                               help="把模型自己高置信度的样本作为额外训练数据")
+    if st.button("🔁 用最新反馈/伪标签重训当前变体", use_container_width=True):
         with st.spinner("正在训练..."):
-            metrics = train_pipeline()
+            metrics = train_pipeline(
+                model_dir=Path(model_dir),
+                variant=variant_choice,
+                pseudo_path=(PSEUDO_PATH if use_pseudo else None),
+            )
             reset_model_cache()
             st.session_state["last_metrics"] = metrics
-        st.success("重训完成. 请刷新或重新上传数据.")
+        st.success("重训完成. 请刷新页面.")
+
+    st.divider()
+    st.subheader("🤖 半监督: 自动生成伪标签")
+    haz_conf = st.slider("隐患 top1 置信度阈值", 0.5, 0.99, 0.92, 0.01)
+    sub_conf = st.slider("分类 top1 置信度阈值", 0.5, 0.99, 0.85, 0.01)
+    if st.button("🌱 用当前模型 + 当前已上传输入打伪标签",
+                  use_container_width=True,
+                  disabled=(model is None or not st.session_state.uploaded_paths)):
+        with st.spinner("打伪标签中..."):
+            info = self_train_pipeline(
+                st.session_state.uploaded_paths, model,
+                haz_conf=haz_conf, sub_conf=sub_conf,
+                pseudo_path=PSEUDO_PATH, use_rules=True,
+            )
+        st.success(
+            f"已生成 {info['n_confident']} 条高置信伪标签 "
+            f"(共聚合 {info['n_total']}). 写入 {info['n_written']} 条."
+        )
+        st.json(info["by_hazard"])
 
 # ---------- 主区: 上传 + 运行 ----------
 st.title("🏭 跑冒滴漏 / 静电 / 化学品暴露 隐患汇总分类系统")
@@ -274,7 +328,7 @@ if df_pred is not None and len(df_pred):
             st.success(f"已写入 {n} 条人工反馈到 {DEFAULT_FB_PATH}")
 
 # ---------- 显示训练指标 ----------
-metrics_path = MODEL_DIR / "metrics.json"
+metrics_path = Path(model_dir) / "metrics.json"
 if metrics_path.exists():
     with st.expander("📊 训练评估指标 (10% 测试集)", expanded=False):
         m = json.loads(metrics_path.read_text())
