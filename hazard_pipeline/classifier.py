@@ -36,7 +36,8 @@ from .rules import (
     rule_predict_subclass,
 )
 from .schema import HAZARD_TYPES, OTHER_LABEL, POSITIVE_TYPES
-from .text_features import make_combined_vectorizer, normalize_text
+from .text_features import (make_combined_vectorizer, make_rich_vectorizer,
+                              normalize_text)
 
 
 # ---------- 主分类器 ----------
@@ -56,8 +57,7 @@ class HazardClassifier:
         labels = list(labels)
 
         # ---- 第一级: 其他 vs 非其他 ----
-        # 使用 LinearSVC + sigmoid 校准, 比 LR 更好的边界 + 校准概率.
-        # 不使用 balanced (会让正类过度被预测, 牺牲对其他的识别).
+        # 使用 LinearSVC + sigmoid 校准, 词 + 字符 ngram TF-IDF.
         y_is_other = np.array([1 if l == OTHER_LABEL else 0 for l in labels])
         base = LinearSVC(C=1.0, max_iter=4000)
         self.is_other_pipe = Pipeline([
@@ -100,15 +100,17 @@ class HazardClassifier:
         return proba, list(self.positive_pipe.named_steps["clf"].classes_)
 
     def predict(self, texts: List[str], use_rules: bool = True
-                ) -> Tuple[List[str], np.ndarray, np.ndarray, List[str]]:
-        """返回 (隐患类型预测, P(其他), P(正类三分类), 正类类别名).
+                ) -> Tuple[List[str], np.ndarray, np.ndarray, List[str], List[bool], List[str]]:
+        """返回 (隐患类型预测, P(其他), P(正类三分类), 正类类别名,
+                rule_overridden flag, 模型原始预测).
 
         规则后处理:
-          - 强关键词命中正类 -> 强制改为该正类 (满足"正类→其他<1%")
-          - 强关键词命中 其他 (且未命中正类) -> 强制为 其他 (帮助降低 FP)
+          - 强关键词命中"其他" -> 强制其他 (训练集上零误伤正类)
+          - 强关键词命中正类 + 模型预测其他 + P(其他)<0.90 -> 改为正类
+        rule_overridden = True 表示最终预测与模型原始预测不一致 (用于 review 触发).
         """
         if not texts:
-            return [], np.array([]), np.empty((0, 3)), self.classes_positive_
+            return [], np.array([]), np.empty((0, 3)), self.classes_positive_, [], []
 
         normed = [normalize_text(t) for t in texts]
         p_other = self.predict_proba_other(normed)
@@ -119,24 +121,25 @@ class HazardClassifier:
             pos_classes = []
 
         preds: List[str] = []
+        rule_overridden: List[bool] = []
+        model_only_preds: List[str] = []
         for i, t in enumerate(normed):
             rule = rule_predict_hazard(t) if use_rules else None
-            # 模型主决策
             if p_other[i] >= self.other_threshold:
                 model_pred = OTHER_LABEL
             else:
                 model_pred = pos_classes[int(np.argmax(pos_proba[i]))] if pos_classes else OTHER_LABEL
+            model_only_preds.append(model_pred)
 
-            # 规则后处理:
-            #  - 规则其他: 直接强制 (在训练集上对正类零误伤)
-            #  - 规则正类: 只在模型置信度不高时 override (避免规则在明显其他场景误报)
+            final_pred = model_pred
             if use_rules and rule:
                 if rule == OTHER_LABEL:
-                    model_pred = OTHER_LABEL
+                    final_pred = OTHER_LABEL
                 elif rule in POSITIVE_TYPES and model_pred == OTHER_LABEL and p_other[i] < 0.90:
-                    model_pred = rule
-            preds.append(model_pred)
-        return preds, p_other, pos_proba, pos_classes
+                    final_pred = rule
+            preds.append(final_pred)
+            rule_overridden.append(final_pred != model_pred)
+        return preds, p_other, pos_proba, pos_classes, rule_overridden, model_only_preds
 
     # ------- 序列化 -------
     def save(self, path: Path):
@@ -196,7 +199,7 @@ class SubClassifier:
             # 计算最常见类用于 fallback
             self.fallback[hz] = pd.Series(ys).value_counts().index[0]
             pipe = Pipeline([
-                ("feat", make_combined_vectorizer()),
+                ("feat", make_rich_vectorizer()),  # 子分类用规则特征 (类内细粒度判别更需要)
                 ("clf", LogisticRegression(
                     max_iter=4000, C=4.0, class_weight="balanced",
                     solver="lbfgs",
@@ -208,35 +211,45 @@ class SubClassifier:
         return self
 
     def predict(self, texts: List[str], hazards: List[str], use_rules: bool = True
-                ) -> Tuple[List[str], List[Optional[np.ndarray]], List[List[str]]]:
+                ) -> Tuple[List[str], List[Optional[np.ndarray]], List[List[str]],
+                            List[bool], List[str]]:
+        """返回 (子类预测, 概率, 类别名, rule_overridden flag, 模型原始预测).
+
+        rule_overridden = True 表示规则匹配的子类与模型 argmax 不一致.
+        """
         out: List[str] = []
         proba_list: List[Optional[np.ndarray]] = []
         cls_list: List[List[str]] = []
+        rule_overridden: List[bool] = []
+        model_only_preds: List[str] = []
         for t, hz in zip(texts, hazards):
             t = normalize_text(t)
             if hz == OTHER_LABEL:
-                out.append("其他")
-                proba_list.append(None)
+                out.append("其他"); proba_list.append(None)
                 cls_list.append(["其他"])
+                rule_overridden.append(False); model_only_preds.append("其他")
                 continue
+            pipe = self.pipes.get(hz)
+            classes = self.classes_.get(hz, [])
+            model_pred = self.fallback.get(hz, "其他")
+            proba = None
+            if pipe is not None:
+                proba = pipe.predict_proba([t])[0]
+                model_pred = classes[int(np.argmax(proba))]
+            model_only_preds.append(model_pred)
+
             rule_sub = rule_predict_subclass(hz, t) if use_rules else None
             if rule_sub:
                 out.append(rule_sub)
-                proba_list.append(None)
-                cls_list.append([rule_sub])
-                continue
-            pipe = self.pipes.get(hz)
-            if pipe is None:
-                out.append(self.fallback.get(hz, "其他"))
-                proba_list.append(None)
-                cls_list.append([self.fallback.get(hz, "其他")])
-                continue
-            proba = pipe.predict_proba([t])[0]
-            classes = self.classes_[hz]
-            out.append(classes[int(np.argmax(proba))])
-            proba_list.append(proba)
-            cls_list.append(classes)
-        return out, proba_list, cls_list
+                proba_list.append(proba)
+                cls_list.append(classes if classes else [rule_sub])
+                rule_overridden.append(rule_sub != model_pred)
+            else:
+                out.append(model_pred)
+                proba_list.append(proba)
+                cls_list.append(classes if classes else [model_pred])
+                rule_overridden.append(False)
+        return out, proba_list, cls_list, rule_overridden, model_only_preds
 
     def save(self, path: Path):
         path = Path(path)
@@ -265,8 +278,10 @@ class FullClassifier:
     sub: SubClassifier
 
     def predict(self, texts: List[str], use_rules: bool = True):
-        haz, p_other, pos_proba, pos_classes = self.hazard.predict(texts, use_rules=use_rules)
-        sub, sub_proba, sub_classes = self.sub.predict(texts, haz, use_rules=use_rules)
+        haz, p_other, pos_proba, pos_classes, haz_rule_over, haz_model_only = \
+            self.hazard.predict(texts, use_rules=use_rules)
+        sub, sub_proba, sub_classes, sub_rule_over, sub_model_only = \
+            self.sub.predict(texts, haz, use_rules=use_rules)
         return {
             "隐患类型": haz,
             "分类": sub,
@@ -275,6 +290,10 @@ class FullClassifier:
             "pos_classes": pos_classes,
             "sub_proba": sub_proba,
             "sub_classes": sub_classes,
+            "haz_rule_overridden": haz_rule_over,
+            "sub_rule_overridden": sub_rule_over,
+            "haz_model_only": haz_model_only,
+            "sub_model_only": sub_model_only,
         }
 
     def save(self, path: Path):

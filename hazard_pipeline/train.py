@@ -120,6 +120,7 @@ def evaluate(full: FullClassifier, df_test: pd.DataFrame) -> dict:
     res = full.predict(texts, use_rules=True)
     pred_haz = res["隐患类型"]
     pred_sub = res["分类"]
+    _ = res.get("haz_rule_overridden")  # 兼容新签名
 
     y_haz_arr = np.array(y_haz)
     pred_haz_arr = np.array(pred_haz)
