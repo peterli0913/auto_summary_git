@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,13 +31,19 @@ from .schema import HAZARD_TYPES, OTHER_LABEL, OUTPUT_COLUMNS, POSITIVE_TYPES
 
 DEFAULT_GOLD_PATH = Path("跑冒滴漏与静电风险专项跟踪.xlsx")
 DEFAULT_MODEL_DIR = Path("models/current")
+ENHANCED_MODEL_DIR = Path("models/enhanced")
 
 
 # ------- 数据加载 -------
 
 def load_training_data(gold_path: Path = DEFAULT_GOLD_PATH,
                        feedback_path: Path = Path("data/feedback/labels.parquet"),
+                       pseudo_path: Optional[Path] = None,
                        ) -> pd.DataFrame:
+    """合并 原始标注 + 人工反馈 (+ 可选 伪标签).
+
+    优先级 (高到低): 人工反馈 > 原始标注 > 伪标签 (按 事件描述 去重)
+    """
     df = pd.read_excel(gold_path)
     if "事件描述" not in df.columns:
         raise ValueError(f"{gold_path} 缺少 '事件描述' 列")
@@ -47,13 +53,36 @@ def load_training_data(gold_path: Path = DEFAULT_GOLD_PATH,
     df["分类"] = df["分类"].fillna("其他").astype(str)
     df = df[df["隐患类型"].isin(HAZARD_TYPES)]
     df = df.reset_index(drop=True)
+    df["_priority"] = 1  # 真实标注
 
+    keep_cols = ["事件描述", "隐患类型", "分类", "_priority"]
+
+    def _pick(d: pd.DataFrame) -> pd.DataFrame:
+        cols = [c for c in keep_cols if c in d.columns]
+        return d[cols].copy()
+
+    parts = [_pick(df)]
     fb = load_feedback(feedback_path)
     if fb is not None and len(fb):
-        # 反馈数据优先 (按事件描述去重)
-        df = pd.concat([df, fb], ignore_index=True)
-        df = df.drop_duplicates(subset=["事件描述"], keep="last").reset_index(drop=True)
-    return df
+        fb = fb.copy(); fb["_priority"] = 2  # 人工反馈最高
+        if "分类" not in fb.columns:
+            fb["分类"] = "其他"
+        parts.append(_pick(fb))
+    if pseudo_path is not None:
+        from .semi_supervised import load_pseudo_labels
+        ps = load_pseudo_labels(pseudo_path)
+        if ps is not None and len(ps):
+            ps = ps.copy(); ps["_priority"] = 0  # 伪标签最低
+            if "分类" not in ps.columns:
+                ps["分类"] = "其他"
+            parts.append(_pick(ps))
+
+    merged = pd.concat(parts, ignore_index=True, sort=False)
+    # 按 事件描述 + 优先级 取最高
+    merged = merged.sort_values("_priority", ascending=False)
+    merged = merged.drop_duplicates(subset=["事件描述"], keep="first")
+    merged = merged.drop(columns=["_priority"]).reset_index(drop=True)
+    return merged
 
 
 # ------- 阈值调优 (在 train 折内部做 CV) -------
@@ -173,23 +202,57 @@ def train_pipeline(gold_path: Path = DEFAULT_GOLD_PATH,
                    feedback_path: Path = Path("data/feedback/labels.parquet"),
                    random_state: int = 42,
                    test_size: float = 0.1,
+                   variant: str = "standard",
+                   pseudo_path: Optional[Path] = None,
                    ) -> dict:
-    df = load_training_data(gold_path, feedback_path)
-    print(f"加载 {len(df)} 条标注数据")
-    print(df["隐患类型"].value_counts().to_string())
+    """训练. variant='standard' 使用 TF-IDF; 'enhanced' 使用 SBERT + TF-IDF.
+
+    若指定 pseudo_path:
+      1. 先用 gold + 人工反馈 切分 train/test (test 严格不含伪标签)
+      2. 再把 伪标签 仅加入到 train (避免评估泄露)
+    """
+    # 不带伪标签做 train/test split (确保 test 干净)
+    df_gold = load_training_data(gold_path, feedback_path, pseudo_path=None)
+    print(f"原始标注 + 反馈共 {len(df_gold)} 条  (variant={variant})")
+    print(df_gold["隐患类型"].value_counts().to_string())
 
     train_df, test_df = train_test_split(
-        df, test_size=test_size, random_state=random_state,
-        stratify=df["隐患类型"],
+        df_gold, test_size=test_size, random_state=random_state,
+        stratify=df_gold["隐患类型"],
     )
+
+    # 把伪标签合并到 train 集合 (排除 test 集合中已有的事件描述)
+    if pseudo_path is not None:
+        from .semi_supervised import load_pseudo_labels
+        ps = load_pseudo_labels(pseudo_path)
+        if ps is not None and len(ps):
+            test_texts = set(test_df["事件描述"].astype(str).tolist())
+            train_texts = set(train_df["事件描述"].astype(str).tolist())
+            ps_filt = ps[~ps["事件描述"].astype(str).isin(test_texts)
+                         & ~ps["事件描述"].astype(str).isin(train_texts)]
+            ps_filt = ps_filt[["事件描述", "隐患类型", "分类"]].dropna(subset=["事件描述", "隐患类型"])
+            ps_filt["分类"] = ps_filt["分类"].fillna("其他")
+            print(f"加入 {len(ps_filt)} 条新伪标签到训练集 "
+                  f"(排除已在 train/test 的事件)")
+            train_df = pd.concat([train_df, ps_filt], ignore_index=True)
+
     print(f"切分: train={len(train_df)}  test={len(test_df)}")
 
-    haz_clf = HazardClassifier()
+    if variant == "enhanced":
+        from .enhanced_classifier import (
+            EnhancedFullClassifier, EnhancedHazardClassifier,
+            EnhancedSubClassifier,
+        )
+        haz_clf = EnhancedHazardClassifier()
+    else:
+        haz_clf = HazardClassifier()
     haz_clf.fit(train_df["事件描述"].tolist(), train_df["隐患类型"].tolist())
 
     # 5-fold OOF 预测, 用于无信息泄露的阈值调优
+    # 加强模型很慢, 默认 3 折; 标准模型 5 折
     print("交叉验证选阈值 (避免使用 test 数据)...")
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    n_folds = 3 if variant == "enhanced" else 5
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
     oof_p_other = np.zeros(len(train_df))
     oof_pos_proba = None
     oof_pos_classes = None
@@ -197,15 +260,24 @@ def train_pipeline(gold_path: Path = DEFAULT_GOLD_PATH,
     train_labels = train_df["隐患类型"].tolist()
     train_idx_arr = np.arange(len(train_df))
     for fold, (tr_i, va_i) in enumerate(skf.split(train_idx_arr, train_labels), 1):
-        sub_clf = HazardClassifier()
-        sub_clf.fit(
+        if variant == "enhanced":
+            from .enhanced_classifier import EnhancedHazardClassifier
+            fold_clf = EnhancedHazardClassifier()
+        else:
+            fold_clf = HazardClassifier()
+        fold_clf.fit(
             [train_texts[i] for i in tr_i],
             [train_labels[i] for i in tr_i],
         )
         va_texts = [train_texts[i] for i in va_i]
-        oof_p_other[va_i] = sub_clf.predict_proba_other(va_texts)
-        if sub_clf.positive_pipe is not None:
-            pp, pc = sub_clf.predict_proba_positive(va_texts)
+        oof_p_other[va_i] = fold_clf.predict_proba_other(va_texts)
+        # 检查正类模型是否存在
+        has_pos = (
+            (variant == "standard" and getattr(fold_clf, "positive_pipe", None) is not None)
+            or (variant == "enhanced" and getattr(fold_clf, "positive_clf", None) is not None)
+        )
+        if has_pos:
+            pp, pc = fold_clf.predict_proba_positive(va_texts)
             if oof_pos_proba is None:
                 oof_pos_classes = pc
                 oof_pos_proba = np.zeros((len(train_df), len(pc)))
@@ -311,16 +383,25 @@ def train_pipeline(gold_path: Path = DEFAULT_GOLD_PATH,
     haz_clf.default_mode = default_mode
 
     # 细分类
-    sub_clf = SubClassifier()
+    if variant == "enhanced":
+        from .enhanced_classifier import (
+            EnhancedFullClassifier, EnhancedSubClassifier,
+        )
+        sub_clf = EnhancedSubClassifier()
+    else:
+        sub_clf = SubClassifier()
     sub_clf.fit(
         train_df["事件描述"].tolist(),
         train_df["隐患类型"].tolist(),
         train_df["分类"].fillna("其他").tolist(),
     )
 
-    full = FullClassifier(hazard=haz_clf, sub=sub_clf)
+    if variant == "enhanced":
+        full = EnhancedFullClassifier(hazard=haz_clf, sub=sub_clf)
+    else:
+        full = FullClassifier(hazard=haz_clf, sub=sub_clf)
     full.save(model_dir)
-    print(f"模型已保存到 {model_dir}")
+    print(f"模型已保存到 {model_dir}  (variant={variant})")
 
     metrics = evaluate(full, test_df)
     metrics["other_threshold"] = haz_clf.other_threshold
@@ -345,13 +426,24 @@ def train_pipeline(gold_path: Path = DEFAULT_GOLD_PATH,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gold", default=str(DEFAULT_GOLD_PATH))
-    parser.add_argument("--model_dir", default=str(DEFAULT_MODEL_DIR))
+    parser.add_argument("--model_dir", default=None,
+                        help="模型保存目录 (默认根据 variant: models/current 或 models/enhanced)")
     parser.add_argument("--feedback", default="data/feedback/labels.parquet")
+    parser.add_argument("--pseudo", default=None,
+                        help="伪标签文件 (启用半监督, 默认 data/feedback/pseudo_labels.parquet)")
+    parser.add_argument("--variant", choices=["standard", "enhanced"], default="standard")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.model_dir is None:
+        args.model_dir = (str(ENHANCED_MODEL_DIR) if args.variant == "enhanced"
+                          else str(DEFAULT_MODEL_DIR))
+    pseudo = Path(args.pseudo) if args.pseudo else None
     train_pipeline(
         gold_path=Path(args.gold),
         model_dir=Path(args.model_dir),
         feedback_path=Path(args.feedback),
+        pseudo_path=pseudo,
+        variant=args.variant,
         random_state=args.seed,
     )

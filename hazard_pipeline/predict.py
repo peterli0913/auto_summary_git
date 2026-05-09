@@ -12,7 +12,20 @@ from .classifier import FullClassifier
 from .schema import OUTPUT_COLUMNS, POSITIVE_TYPES, OTHER_LABEL
 
 
-def predict_dataframe(df: pd.DataFrame, model: FullClassifier,
+def load_model_auto(model_dir: Union[str, Path]):
+    """根据 model_dir 中的 variant.txt 自动选择 standard / enhanced 加载."""
+    p = Path(model_dir)
+    variant_file = p / "variant.txt"
+    variant = "standard"
+    if variant_file.exists():
+        variant = variant_file.read_text().strip()
+    if variant == "enhanced":
+        from .enhanced_classifier import EnhancedFullClassifier
+        return EnhancedFullClassifier.load(p)
+    return FullClassifier.load(p)
+
+
+def predict_dataframe(df: pd.DataFrame, model,
                       use_rules: bool = True,
                       hazard_review_top1_max: float = 0.85,
                       hazard_review_diff_min: float = 0.30,
@@ -101,9 +114,12 @@ def predict_dataframe(df: pd.DataFrame, model: FullClassifier,
 def run_pipeline(input_files: Sequence[Union[str, Path]],
                  model_dir: Union[str, Path] = "models/current",
                  use_rules: bool = True) -> pd.DataFrame:
-    """端到端: 5 个输入文件 -> 统一格式 + 预测."""
+    """端到端: 5 个输入文件 -> 统一格式 + 预测.
+
+    自动识别 model_dir 中的 variant (standard/enhanced).
+    """
     df = aggregate_files(input_files)
     if not len(df):
         return df
-    model = FullClassifier.load(Path(model_dir))
+    model = load_model_auto(model_dir)
     return predict_dataframe(df, model, use_rules=use_rules)
