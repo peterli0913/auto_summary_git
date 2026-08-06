@@ -209,14 +209,39 @@ https://<你填的 App URL>.streamlit.app
 
 ## 故障排查
 
+### ❗ 页面一直停在 "Deploying…" / 跑不起来
+
+最常见的 3 个原因（按顺序检查）：
+
+1. **部署分支选错了**  
+   `main` 分支 **没有** `app.py` / `hazard_pipeline/`，只有原始 Excel。  
+   必须部署：
+   ```
+   Branch = cursor/hazard-classifier-pipeline-3238
+   Main file path = app.py
+   ```
+   在 https://share.streamlit.io → 你的 app → 右上角 `⋮` → **Settings** → **General** → 改 Branch → **Save** → 再点 **Reboot app**.
+
+2. **看日志确认卡在哪**  
+   同一页面点 **Manage app**（或右下角 "Manage app"）→ **Logs**：
+   - `Installing dependencies…` 超过 10 分钟 → 点 **Reboot**
+   - `Out of memory` / `Killed` → 已修复（启动时不再自动重训）；确保仓库里有 `models/current/`，然后 Reboot
+   - `Error: No such file: app.py` → 分支错了，见上一条
+
+3. **被登录墙挡住**（看起来像一直转圈）  
+   打开 https://hazard-classifier.streamlit.app 若跳到 `share.streamlit.io/-/auth/...`，说明开了访问控制。  
+   去 Settings → **Sharing** → 关掉 "Only my workspace" / Viewer authentication，改成 **Public**，保存后再开。
+
+### 其他
+
 | 现象 | 原因 / 解决 |
 |---|---|
 | 部署日志卡在 `Installing dependencies` 超过 10 分钟 | Streamlit Cloud 偶尔慢，点页面右上角 `⋮ → Reboot app` 重新部署 |
-| 应用显示 `OOM` 或 `Out of memory` | 加强模型在免费 1GB 内存上偶发；改用 standard 即可 |
+| 应用显示 `OOM` 或 `Out of memory` | 加强模型在免费 1GB 内存上偶发；改用 standard 即可（仓库已预置 `models/current/`） |
 | 点了「📦 安装加强模型依赖」失败 | 在 `requirements.txt` 中取消注释下面两行后重新部署：<br>`# sentence-transformers>=2.2`<br>`# torch>=2.0` |
 | 上传的训练 Excel 没解析到数据 | 检查表头里是否有 `事件描述` 与 `隐患类型` 两列（不能写成 `事件_描述` 这种） |
 | App 刷新后人工反馈没了 | Streamlit Cloud sandbox 不持久；要长期保留标注，请 commit 到 git |
-| 想换分支部署 | 在 Streamlit Cloud 后台点 `Settings → Branch`，改成你想要的分支后 `Save` |
+| 想换分支部署 | 在 Streamlit Cloud 后台点 `Settings → Branch`，改成 `cursor/hazard-classifier-pipeline-3238` 后 `Save` |
 
 ---
 

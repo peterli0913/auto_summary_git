@@ -10,9 +10,9 @@ __pycache__/
 venv/
 env/
 
-# 模型工件: enhanced 模型保留在 git 中 (44MB), 避免每次 cloud agent 重训.
-# 仅忽略 standard 模型 (训练快, 30秒可重生) 与训练日志.
-models/current/
+# 模型工件: standard (11MB) + enhanced (44MB) 都保留在 git 中,
+# 避免 Streamlit Cloud / cloud agent 每次重训 (Cloud 1GB 上启动时重训会 OOM).
+# 仅忽略训练日志:
 models/*/metrics.json
 
 # SBERT cache (HF hub 下载的 transformer 权重)

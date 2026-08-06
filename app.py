@@ -82,17 +82,21 @@ def _model_trained(variant: str) -> bool:
 
 
 def bootstrap_default_model():
-    """Streamlit Cloud 部署后第一次启动时, 模型还没训过.
-    自动训一个 standard 模型让用户可以立刻用上.
+    """Cloud 友好启动: 绝不在 import / 首次渲染时做重训练.
+
+    之前的实现会在首次启动时跑 train_pipeline (含 5-fold OOF),
+    在 Streamlit Community Cloud 1GB 内存上极易 OOM / 超时,
+    导致页面一直停在 "Deploying…".
+
+    现在策略:
+      1. 若仓库已提交 models/enhanced → 直接可用, 什么都不做
+      2. 若 models/current 已存在 → 什么都不做
+      3. 否则仅提示用户去「模型管理」面板点按钮训练
+         (不在启动路径上阻塞)
     """
-    if _model_trained("standard"):
+    if _model_trained("enhanced") or _model_trained("standard"):
         return False
-    if not Path(DEFAULT_GOLD).exists():
-        return False
-    with st.spinner(f"首次启动: 自动训练标准模型 (~30 秒)..."):
-        train_pipeline(variant="standard", model_dir=DEFAULT_MODEL_DIR)
-    reset_model_cache()
-    return True
+    return False  # 永不自动重训; 留给 UI 按钮
 
 
 def has_enhanced_deps() -> bool:
@@ -173,11 +177,17 @@ if "human_corrections" not in st.session_state:
 if "uploaded_paths" not in st.session_state:
     st.session_state.uploaded_paths = []
 if "bootstrapped" not in st.session_state:
-    # 首次启动时自动训练标准模型 (Streamlit Cloud 部署友好)
-    if bootstrap_default_model():
-        st.session_state.bootstrapped = "standard 已自动训练"
-    else:
-        st.session_state.bootstrapped = "skip"
+    # 不阻塞启动; 仅记录可用模型状态
+    try:
+        bootstrap_default_model()
+        if _model_trained("enhanced"):
+            st.session_state.bootstrapped = "enhanced ready (pre-committed)"
+        elif _model_trained("standard"):
+            st.session_state.bootstrapped = "standard ready"
+        else:
+            st.session_state.bootstrapped = "no model yet — use 模型管理 panel"
+    except Exception as e:
+        st.session_state.bootstrapped = f"bootstrap skipped: {e}"
 
 
 # ---------- 侧栏 ----------
@@ -185,20 +195,39 @@ with st.sidebar:
     st.header("⚙️ 设置")
 
     st.subheader("🧠 模型变体")
+    # Cloud 默认用 standard: 仓库已提交 11MB 模型, 无需 torch, 秒开.
+    # enhanced 需要额外装 sentence-transformers (在「模型管理」里一键装).
+    _variant_options = ["standard", "enhanced"]
+    _default_variant_idx = 0
     variant_choice = st.radio(
         "选择模型",
-        options=["standard", "enhanced"],
+        options=_variant_options,
+        index=_default_variant_idx,
         format_func=lambda v: VARIANT_LABELS[v],
         help="加强模型用 sentence-transformer 中文 embedding + TF-IDF 拼接, "
-             "在 holdout 上 其他→正类 错误更少, 但推理速度略慢.",
+             "在 holdout 上 其他→正类 错误更少, 但推理速度略慢. "
+             "Cloud 上 enhanced 需先在「模型管理」安装依赖.",
     )
     model_dir = str(VARIANT_DIRS[variant_choice])
-    model = load_model_cached(model_dir)
+    model = None
+    load_err = None
+    try:
+        if Path(model_dir).exists():
+            # enhanced 变体需要 torch/sentence-transformers; 未装时给出友好提示
+            if variant_choice == "enhanced" and not has_enhanced_deps():
+                load_err = ("enhanced 依赖未安装. 请展开主区「🛠 模型管理」→ "
+                            "点「📦 安装加强模型依赖」, 或先切到 standard.")
+            else:
+                model = load_model_cached(model_dir)
+    except Exception as e:
+        load_err = f"加载失败: {e}"
+
     if model is None:
-        st.error(
-            f"模型 ({variant_choice}) 未训练. 请先运行:\n"
-            f"`python scripts/train_initial.py --variant {variant_choice}`"
-        )
+        st.error(load_err or (
+            f"模型 ({variant_choice}) 未就绪. 请展开主区「🛠 模型管理」训练, "
+            f"或确认部署分支是 `cursor/hazard-classifier-pipeline-3238` "
+            f"(main 分支没有 app.py)."
+        ))
     else:
         st.success(f"已加载: {variant_choice}")
         modes = list(model.hazard.threshold_modes.keys()) if model.hazard.threshold_modes else ["default"]
