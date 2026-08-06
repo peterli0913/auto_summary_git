@@ -1,6 +1,8 @@
 # 跑冒滴漏 / 静电 / 化学品暴露 隐患汇总分类系统
 
-> 🚀 **想直接在浏览器里用？** 见 [`DEPLOY.md`](DEPLOY.md) 把 app 一键部署到 Streamlit Community Cloud (免费, 永久公网链接).
+> 🚀 **想直接在浏览器里用？**
+> - 推荐 Render（更稳，少 throttled）：见 [`RENDER_DEPLOY.md`](RENDER_DEPLOY.md)
+> - 或 Streamlit Community Cloud：见 [`DEPLOY.md`](DEPLOY.md)
 
 工业级 Python 工程, 完成 5 类原始 Excel 的汇总, 隐患类型 (4 类) 与
 分类 (51 个细分类) 的自动分类, 并提供:
