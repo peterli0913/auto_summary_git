@@ -1,8 +1,11 @@
 [server]
 headless = true
-enableCORS = false
-enableXsrfProtection = false
+# 允许上传较大的 ZIP(整个文件夹). 单位 MB.
 maxUploadSize = 500
+
+# 说明: 这里刻意不设 enableCORS / enableXsrfProtection.
+# 关掉 XSRF 保护既降低安全性, 官方也提示可能让 file_uploader 在
+# Streamlit Cloud 这类带反向代理的环境下出问题. 保持默认即可.
 
 [browser]
 gatherUsageStats = false
