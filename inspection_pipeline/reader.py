@@ -23,6 +23,32 @@ from .schema import (CONTENT_COL, DATE_COL, DATE_COLUMN_BLOCKLIST, KIND_COL,
 HEADER_CANDIDATES: Tuple[int, ...] = (1, 0, 2)
 
 
+def _preferred_engine() -> Optional[str]:
+    """优先用 calamine (Rust 实现, 比 openpyxl 快 4 倍以上).
+
+    没装就返回 None, 让 pandas 自己挑 (openpyxl / xlrd).
+    """
+    try:
+        import python_calamine  # noqa: F401
+        return "calamine"
+    except Exception:
+        return None
+
+
+_ENGINE = _preferred_engine()
+
+
+def _open_workbook(buf: Any) -> pd.ExcelFile:
+    """打开工作簿; calamine 读不了的个别文件回退到默认引擎."""
+    if _ENGINE:
+        try:
+            return pd.ExcelFile(buf, engine=_ENGINE)
+        except Exception:
+            if hasattr(buf, "seek"):
+                buf.seek(0)
+    return pd.ExcelFile(buf)
+
+
 @dataclass
 class ReadResult:
     """单个文件的解析结果 + 诊断信息 (供界面展示)."""
@@ -145,6 +171,26 @@ def pick_content_column(df: pd.DataFrame, kind: str) -> Optional[str]:
 
 # ---------------- 主读取逻辑 ----------------
 
+def _frame_from_grid(grid: pd.DataFrame, header_row: int) -> pd.DataFrame:
+    """把 header=None 读出来的整块表格, 按指定表头行切成正常 DataFrame."""
+    cols = [str(c).strip() for c in grid.iloc[header_row].tolist()]
+    # 同名列补后缀, 避免后续按列名取值时拿到 DataFrame
+    seen: dict[str, int] = {}
+    unique_cols = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            unique_cols.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0
+            unique_cols.append(c)
+
+    body = grid.iloc[header_row + 1:].copy()
+    body.columns = unique_cols
+    body = body.dropna(how="all").reset_index(drop=True)
+    return body
+
+
 def _dedupe_header_row(df: pd.DataFrame) -> pd.DataFrame:
     """有些导出会让第一行数据重复列名, 去掉它."""
     if len(df) == 0:
@@ -184,36 +230,39 @@ def read_inspection_excel(source: Union[str, Path, io.BytesIO, bytes],
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            xl = pd.ExcelFile(buf)
-            sheet_names = xl.sheet_names
+            xl = _open_workbook(buf)
 
+            # 每个 sheet 只整体读一次 (header=None), 再在内存里挑表头行.
+            # 之前是 "探测读 + 全量读", 同一张表要解析两遍.
             best: Optional[Tuple[pd.DataFrame, str, int]] = None
-            for sheet in sheet_names:
+            fallback: Optional[Tuple[pd.DataFrame, str, int]] = None
+            for sheet in xl.sheet_names:
+                try:
+                    grid = xl.parse(sheet, header=None, dtype=object)
+                except Exception:
+                    continue
+                if grid.empty:
+                    continue
+                if fallback is None:
+                    fallback = (grid, sheet, 1 if len(grid) > 1 else 0)
                 for header in HEADER_CANDIDATES:
-                    try:
-                        probe = xl.parse(sheet, header=header, nrows=6, dtype=object)
-                    except Exception:
+                    if header >= len(grid):
                         continue
-                    if _has_known_content(probe.columns):
-                        full = xl.parse(sheet, header=header, dtype=object)
-                        best = (full, sheet, header)
+                    cols = [str(c).strip() for c in grid.iloc[header].tolist()]
+                    if _has_known_content(cols):
+                        best = (grid, sheet, header)
                         break
                 if best:
                     break
 
-            # 没匹配到已知列名 -> 用第一个 sheet 的 header=1 兜底
             if best is None:
-                sheet = sheet_names[0]
-                header = 1
-                try:
-                    full = xl.parse(sheet, header=header, dtype=object)
-                except Exception:
-                    header = 0
-                    full = xl.parse(sheet, header=header, dtype=object)
-                best = (full, sheet, header)
+                if fallback is None:
+                    result.error = "文件里没有可读取的工作表"
+                    return result
+                best = fallback
 
-        df, sheet, header = best
-        df.columns = [str(c).strip() for c in df.columns]
+        grid, sheet, header = best
+        df = _frame_from_grid(grid, header)
         df = _dedupe_header_row(df)
 
         result.sheet_name = sheet
