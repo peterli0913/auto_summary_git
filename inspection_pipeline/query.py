@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from .schema import CONTENT_COL
@@ -87,39 +88,85 @@ def parse(expr: str) -> Expression:
     return Expression(or_groups=or_groups, raw=text)
 
 
-def build_mask(series: pd.Series, expression: Expression,
-               case_sensitive: bool = False) -> pd.Series:
-    """对文本列生成布尔掩码."""
+def build_haystack(series: pd.Series, case_sensitive: bool = False) -> np.ndarray:
+    """把待搜索的文本列预处理成 numpy 对象数组.
+
+    用 Python 原生 `in` 而不是 pandas .str.contains / pyarrow match_substring:
+    这些短文本上实测原生 `in` 快 3 倍左右 (68k 行: 10.5ms -> 3.7ms).
+    预处理结果可以复用, 避免每次查询都重新 lower 一遍.
+    """
     text = series.astype("string").fillna("")
     if not case_sensitive:
-        haystack = text.str.lower()
-    else:
-        haystack = text
+        text = text.str.lower()
+    return text.to_numpy(dtype=object)
 
-    total = pd.Series(False, index=series.index)
+
+def mask_from_haystack(haystack: np.ndarray, expression: Expression,
+                       case_sensitive: bool = False) -> np.ndarray:
+    """在预处理好的数组上求布尔掩码.
+
+    两处剪枝:
+      * 与(&): 每多一个关键词就把候选集收窄一次, 后面的关键词只在
+        前面已命中的行里找 —— 关键词越多越快
+      * 或(|): 已经命中的行不再参与后续或组的匹配
+    """
+    n = len(haystack)
+    total = np.zeros(n, dtype=bool)
+    if n == 0:
+        return total
+
     for group in expression.or_groups:
-        group_mask = pd.Series(True, index=series.index)
+        candidates = np.nonzero(~total)[0]
+        if candidates.size == 0:
+            break
         for term in group:
             needle = term if case_sensitive else term.lower()
-            group_mask &= haystack.str.contains(needle, regex=False, na=False)
-        total |= group_mask
+            subset = haystack[candidates]
+            keep = np.fromiter((needle in s for s in subset),
+                               dtype=bool, count=len(subset))
+            candidates = candidates[keep]
+            if candidates.size == 0:
+                break
+        total[candidates] = True
     return total
+
+
+def build_mask(series: pd.Series, expression: Expression,
+               case_sensitive: bool = False) -> pd.Series:
+    """对文本列生成布尔掩码 (内部走 build_haystack + mask_from_haystack)."""
+    haystack = build_haystack(series, case_sensitive=case_sensitive)
+    mask = mask_from_haystack(haystack, expression, case_sensitive=case_sensitive)
+    return pd.Series(mask, index=series.index)
+
+
+def _resolve_haystack(df: pd.DataFrame, content_col: str, case_sensitive: bool,
+                      haystack: Optional[np.ndarray]) -> np.ndarray:
+    if haystack is not None:
+        return haystack
+    return build_haystack(df[content_col], case_sensitive=case_sensitive)
 
 
 def filter_dataframe(df: pd.DataFrame, expr: str,
                      content_col: str = CONTENT_COL,
-                     case_sensitive: bool = False) -> tuple[pd.DataFrame, Expression]:
-    """按表达式筛选. 返回 (命中的行, 解析后的表达式)."""
+                     case_sensitive: bool = False,
+                     haystack: Optional[np.ndarray] = None,
+                     ) -> tuple[pd.DataFrame, Expression]:
+    """按表达式筛选. 返回 (命中的行, 解析后的表达式).
+
+    haystack 可以传入 build_haystack 的结果复用, 省掉重复预处理.
+    """
     expression = parse(expr)
     if df is None or len(df) == 0:
         return df.iloc[0:0] if df is not None else pd.DataFrame(), expression
-    mask = build_mask(df[content_col], expression, case_sensitive=case_sensitive)
-    return df[mask].copy(), expression
+    hay = _resolve_haystack(df, content_col, case_sensitive, haystack)
+    mask = mask_from_haystack(hay, expression, case_sensitive=case_sensitive)
+    return df.loc[mask].copy(), expression
 
 
 def count_matches(df: pd.DataFrame, expr: str,
                   content_col: str = CONTENT_COL,
-                  case_sensitive: bool = False) -> int:
+                  case_sensitive: bool = False,
+                  haystack: Optional[np.ndarray] = None) -> int:
     """只要个数 (统计功能用). 表达式非法时返回 0."""
     try:
         expression = parse(expr)
@@ -127,23 +174,27 @@ def count_matches(df: pd.DataFrame, expr: str,
         return 0
     if df is None or len(df) == 0:
         return 0
-    return int(build_mask(df[content_col], expression,
-                          case_sensitive=case_sensitive).sum())
+    hay = _resolve_haystack(df, content_col, case_sensitive, haystack)
+    return int(mask_from_haystack(hay, expression,
+                                  case_sensitive=case_sensitive).sum())
 
 
 def count_many(df: pd.DataFrame, exprs: Sequence[str],
                content_col: str = CONTENT_COL,
-               case_sensitive: bool = False) -> pd.DataFrame:
+               case_sensitive: bool = False,
+               haystack: Optional[np.ndarray] = None) -> pd.DataFrame:
     """批量统计多个关键词/表达式的命中数, 返回 关键词/条目数/占比 表."""
     total = 0 if df is None else len(df)
+    hay = (_resolve_haystack(df, content_col, case_sensitive, haystack)
+           if total else None)
     rows = []
     for e in exprs:
-        n = count_matches(df, e, content_col=content_col,
-                          case_sensitive=case_sensitive)
+        n = (count_matches(df, e, content_col=content_col,
+                           case_sensitive=case_sensitive, haystack=hay)
+             if total else 0)
         rows.append({
             "关键词": e,
             "条目数": n,
             "占比": (n / total) if total else 0.0,
         })
-    out = pd.DataFrame(rows, columns=["关键词", "条目数", "占比"])
-    return out
+    return pd.DataFrame(rows, columns=["关键词", "条目数", "占比"])
