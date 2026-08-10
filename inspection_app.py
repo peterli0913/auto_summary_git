@@ -40,6 +40,10 @@ def init_state() -> None:
     ss.setdefault("chart_counts", None)    # 统计结果 DataFrame
     ss.setdefault("case_sensitive", False)
     ss.setdefault("loaded_from_disk", False)
+    ss.setdefault("db_version", 0)      # 数据库每变一次 +1, 用来作废缓存
+    ss.setdefault("_hay", None)         # 预处理好的搜索数组
+    ss.setdefault("_hay_token", None)
+    ss.setdefault("_count_cache", {})   # (关键词, token) -> 命中数
 
     # 首次进入时自动读取上一次保存的数据库
     if ss.db is None and not ss.loaded_from_disk:
@@ -50,6 +54,53 @@ def init_state() -> None:
 
 
 init_state()
+
+
+def set_db(df) -> None:
+    """统一入口: 换数据库时同步作废搜索缓存."""
+    st.session_state.db = df
+    st.session_state.db_version += 1
+    st.session_state._hay = None
+    st.session_state._hay_token = None
+    st.session_state._count_cache = {}
+
+
+def search_token() -> tuple:
+    return (st.session_state.db_version, st.session_state.case_sensitive)
+
+
+def get_haystack():
+    """预处理后的搜索数组, 每个 (数据库版本, 大小写选项) 只算一次.
+
+    否则每次交互重跑脚本都要把 68k 条文本重新 lower 一遍.
+    """
+    token = search_token()
+    if st.session_state._hay_token != token:
+        db = st.session_state.db
+        st.session_state._hay = (
+            None if db is None or not len(db)
+            else query.build_haystack(
+                db[CONTENT_COL], case_sensitive=st.session_state.case_sensitive)
+        )
+        st.session_state._hay_token = token
+    return st.session_state._hay
+
+
+def cached_count(keyword: str) -> int:
+    """关键词命中数, 跨 rerun 复用.
+
+    关键词清单里每一行都要显示命中数; 不缓存的话每加一个关键词
+    或勾一个框, 全部关键词都会被重新统计一遍.
+    """
+    key = (keyword, search_token())
+    cache = st.session_state._count_cache
+    if key not in cache:
+        cache[key] = query.count_matches(
+            st.session_state.db, keyword,
+            case_sensitive=st.session_state.case_sensitive,
+            haystack=get_haystack(),
+        )
+    return cache[key]
 
 
 def kw_key(keyword: str) -> str:
@@ -70,6 +121,39 @@ def is_checked(keyword: str) -> bool:
 def set_all_checked(value: bool) -> None:
     for kw in st.session_state.keywords:
         st.session_state[kw_key(kw)] = value
+
+
+# ── 重活缓存 ──────────────────────────────────────────────────────
+# st.download_button 的 data= 和图表 PNG 都是"每次 rerun 都会重新算"的:
+# 68k 行导出 Excel 约 1.8 秒、kaleido 出 PNG 约 1.2 秒, 于是随便点个勾选框
+# 都要等 3 秒. 这里按内容签名缓存, 只有数据真的变了才重算.
+# 下划线开头的参数不参与缓存键计算 (Streamlit 约定).
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def summary_excel(_df, cols: tuple, _extra, token: tuple) -> bytes:
+    return exporter.to_excel_bytes(_df[list(cols)], sheet_name="巡查汇总",
+                                    extra_sheets=_extra)
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def filtered_excel(_df, cols: tuple, _extra, token: tuple) -> bytes:
+    return exporter.to_excel_bytes(_df[list(cols)], sheet_name="筛选结果",
+                                    extra_sheets=_extra)
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def counts_excel(_counts, token: tuple) -> bytes:
+    return exporter.to_excel_bytes(_counts, sheet_name="关键词统计")
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def chart_png(_fig, token: tuple):
+    return charts.fig_to_png(_fig)
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def chart_html(_fig, token: tuple) -> bytes:
+    return charts.fig_to_html(_fig)
 
 
 def parse_one_cached(name: str, src):
@@ -131,7 +215,7 @@ with st.sidebar:
 
     st.divider()
     if st.button("🗑 清空数据库", width="stretch"):
-        st.session_state.db = None
+        set_db(None)
         st.session_state.filtered = None
         st.session_state.chart_counts = None
         st.session_state.read_results = []
@@ -249,7 +333,7 @@ with tab1:
                    else pd.DataFrame(columns=[DATE_COL, CONTENT_COL,
                                               SOURCE_FILE_COL, KIND_COL]))
             final = database.build_dataframe(raw, dedupe_rows=dedupe_rows)
-            st.session_state.db = final
+            set_db(final)
             st.session_state.read_results = results
             st.session_state.filtered = None
             st.session_state.chart_counts = None
@@ -309,15 +393,14 @@ with tab1:
         st.dataframe(db[cols].head(PREVIEW_ROWS), hide_index=True,
                      width="stretch", height=420)
 
+        extra = ({"按台账类型统计": (
+            db[KIND_COL].value_counts().rename_axis("台账类型")
+            .reset_index(name="条目数"))}
+            if KIND_COL in db.columns else None)
         st.download_button(
             "📥 生成并下载汇总 Excel",
-            data=exporter.to_excel_bytes(
-                db[cols], sheet_name="巡查汇总",
-                extra_sheets={"按台账类型统计": (
-                    db[KIND_COL].value_counts().rename_axis("台账类型")
-                    .reset_index(name="条目数")
-                )} if KIND_COL in db.columns else None,
-            ),
+            data=summary_excel(db, tuple(cols), extra,
+                               (st.session_state.db_version, tuple(cols))),
             file_name=f"巡查汇总_{len(db)}条_{timestamp()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
@@ -352,7 +435,8 @@ with tab2:
             try:
                 sub, expression = query.filter_dataframe(
                     db, expr_input,
-                    case_sensitive=st.session_state.case_sensitive)
+                    case_sensitive=st.session_state.case_sensitive,
+                    haystack=get_haystack())
                 st.session_state.filtered = sub
                 st.session_state.filter_expr_desc = expression.describe()
                 st.session_state.filter_expr_raw = expression.raw
@@ -381,18 +465,18 @@ with tab2:
 
                 safe = "".join(ch for ch in st.session_state.get("filter_expr_raw", "")
                                if ch not in r'\/:*?"<>|')[:40] or "筛选"
+                cond_sheet = {"筛选条件": pd.DataFrame([{
+                    "筛选表达式": st.session_state.get("filter_expr_raw", ""),
+                    "条件解释": st.session_state.filter_expr_desc,
+                    "命中条目数": n,
+                    "数据库总条目数": total,
+                }])}
                 st.download_button(
                     "📥 生成并下载筛选结果 Excel",
-                    data=exporter.to_excel_bytes(
-                        sub[keep], sheet_name="筛选结果",
-                        extra_sheets={"筛选条件": pd.DataFrame([{
-                            "筛选表达式": st.session_state.get("filter_expr_raw", ""),
-                            "条件解释": st.session_state.filter_expr_desc,
-                            "命中条目数": n,
-                            "数据库总条目数": total,
-                            "生成时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }])},
-                    ),
+                    data=filtered_excel(
+                        sub, tuple(keep), cond_sheet,
+                        (st.session_state.db_version,
+                         st.session_state.get("filter_expr_raw", ""), n)),
                     file_name=f"筛选_{safe}_{n}条_{timestamp()}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
@@ -459,9 +543,7 @@ with tab3:
                 row[0].checkbox("显示", key=kw_key(kw),
                                 label_visibility="collapsed")
                 row[1].write(f"`{kw}`")
-                n_hit = query.count_matches(
-                    db, kw, case_sensitive=st.session_state.case_sensitive)
-                row[2].write(f"{n_hit:,}")
+                row[2].write(f"{cached_count(kw):,}")
                 if row[3].button("🗑", key=f"kwdel::{kw}", help=f"删除「{kw}」"):
                     to_delete = kw
 
@@ -483,7 +565,9 @@ with tab3:
 
             if st.button("📊 生成图表", type="primary", disabled=not selected):
                 counts = query.count_many(
-                    db, selected, case_sensitive=st.session_state.case_sensitive)
+                    db, selected,
+                    case_sensitive=st.session_state.case_sensitive,
+                    haystack=get_haystack())
                 if sort_desc:
                     counts = counts.sort_values("条目数", ascending=False,
                                                  kind="mergesort").reset_index(drop=True)
@@ -509,23 +593,40 @@ with tab3:
                 st.dataframe(show, hide_index=True, width="stretch")
 
                 st.markdown("**保存图表**")
+                # 图表签名: 内容不变就复用已生成的 PNG/HTML
+                fig_token = (
+                    st.session_state.get("chart_type", chart_type),
+                    st.session_state.get("chart_show_values", True),
+                    len(db),
+                    tuple(zip(counts["关键词"].tolist(), counts["条目数"].tolist())),
+                )
+                want_png = st.checkbox(
+                    "准备高清 PNG（首次约 1 秒）", value=False,
+                    help="服务器渲染 PNG 比较慢，所以默认不做。"
+                         "图表右上角的相机图标本来就能直接存 PNG，是即时的。",
+                )
                 s1, s2, s3 = st.columns(3)
-                png, err = charts.fig_to_png(fig)
                 with s1:
-                    if png:
-                        st.download_button(
-                            "🖼 保存图表 (PNG)", data=png,
-                            file_name=f"关键词统计_{timestamp()}.png",
-                            mime="image/png", type="primary",
-                            width="stretch",
-                        )
+                    if want_png:
+                        png, err = chart_png(fig, fig_token)
+                        if png:
+                            st.download_button(
+                                "🖼 保存图表 (PNG)", data=png,
+                                file_name=f"关键词统计_{timestamp()}.png",
+                                mime="image/png", type="primary",
+                                width="stretch",
+                            )
+                        else:
+                            st.button("🖼 PNG 不可用", disabled=True,
+                                       width="stretch",
+                                       help=f"当前环境无法导出 PNG：{err}。"
+                                            f"请用 HTML 或图表右上角相机按钮。")
                     else:
-                        st.button("🖼 PNG 不可用", disabled=True,
-                                   width="stretch",
-                                   help=f"当前环境无法导出 PNG：{err}。请使用 HTML 或图表右上角相机按钮。")
+                        st.caption("需要高清 PNG 时勾选上面的选项；"
+                                   "或直接点图表右上角的 📷。")
                 with s2:
                     st.download_button(
-                        "🌐 保存图表 (HTML)", data=charts.fig_to_html(fig),
+                        "🌐 保存图表 (HTML)", data=chart_html(fig, fig_token),
                         file_name=f"关键词统计_{timestamp()}.html",
                         mime="text/html", width="stretch",
                         help="自包含网页，双击即可在浏览器打开，中文显示正常。",
@@ -533,10 +634,8 @@ with tab3:
                 with s3:
                     st.download_button(
                         "📥 下载统计数据 (Excel)",
-                        data=exporter.to_excel_bytes(counts, sheet_name="关键词统计"),
+                        data=counts_excel(counts, fig_token),
                         file_name=f"关键词统计_{timestamp()}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         width="stretch",
                     )
-                if png is None and err:
-                    st.caption("提示：图表右上角工具栏的相机图标也可直接下载 PNG。")
