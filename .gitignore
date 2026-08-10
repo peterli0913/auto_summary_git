@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# 模型工件: standard (11MB) + enhanced (44MB) 都保留在 git 中,
+# 避免 Streamlit Cloud / cloud agent 每次重训 (Cloud 1GB 上启动时重训会 OOM).
+# 仅忽略训练日志:
+models/*/metrics.json
+
+# SBERT cache (HF hub 下载的 transformer 权重)
+.cache/
+~/.cache/huggingface/
+
+# 运行时数据
+data/uploads/
+data/outputs/
+data/feedback/
+
+# Streamlit cache
+.streamlit/
