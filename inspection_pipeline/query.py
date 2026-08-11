@@ -63,6 +63,54 @@ class Expression:
         return seen
 
 
+def format_expression(expression: "Expression") -> str:
+    """把表达式序列化回可被 parse() 读回的字符串 (无需括号).
+
+    因为内部就是"或组的列表, 每组是若干与项", 直接拼成
+    A&B|A&C 形式即可, parse() 读回来完全等价.
+    """
+    return "|".join("&".join(group) for group in expression.or_groups)
+
+
+def combine_levels(exprs: Sequence[str]) -> Expression:
+    """多级筛选: 每一级都在上一级结果里继续筛, 即各级取交集.
+
+    每级本身是「或组的列表」, 多级求交等于对各级的或组做笛卡尔积,
+    把每种组合的关键词并到一个与组里. 例如
+        第一级 阀门          -> [[阀门]]
+        第二级 渗漏|管路      -> [[渗漏], [管路]]
+    合并后 -> [[阀门,渗漏], [阀门,管路]] , 即 阀门&渗漏|阀门&管路
+    这样多级筛选也能用同一套匹配逻辑, 并且能作为单个表达式存进统计清单.
+    """
+    parsed = [parse(e) for e in exprs if str(e).strip()]
+    if not parsed:
+        raise EmptyExpression("请输入至少一个关键词")
+
+    combos: List[List[str]] = [[]]
+    for expression in parsed:
+        merged: List[List[str]] = []
+        for prefix in combos:
+            for group in expression.or_groups:
+                terms = list(prefix)
+                for term in group:
+                    if term not in terms:      # 去掉重复关键词
+                        terms.append(term)
+                merged.append(terms)
+        combos = merged
+
+    # 去掉完全重复的与组
+    unique: List[List[str]] = []
+    seen = set()
+    for group in combos:
+        key = tuple(sorted(group))
+        if key not in seen:
+            seen.add(key)
+            unique.append(group)
+
+    raw = " → ".join(normalize(e) for e in exprs if str(e).strip())
+    return Expression(or_groups=unique, raw=raw)
+
+
 def normalize(expr: str) -> str:
     text = str(expr or "")
     for src, dst in _NORMALIZE.items():
@@ -146,6 +194,18 @@ def _resolve_haystack(df: pd.DataFrame, content_col: str, case_sensitive: bool,
     return build_haystack(df[content_col], case_sensitive=case_sensitive)
 
 
+def filter_by_expression(df: pd.DataFrame, expression: Expression,
+                         content_col: str = CONTENT_COL,
+                         case_sensitive: bool = False,
+                         haystack: Optional[np.ndarray] = None) -> pd.DataFrame:
+    """用已解析好的表达式筛选 (多级筛选合并后走这里)."""
+    if df is None or len(df) == 0:
+        return df.iloc[0:0] if df is not None else pd.DataFrame()
+    hay = _resolve_haystack(df, content_col, case_sensitive, haystack)
+    mask = mask_from_haystack(hay, expression, case_sensitive=case_sensitive)
+    return df.loc[mask].copy()
+
+
 def filter_dataframe(df: pd.DataFrame, expr: str,
                      content_col: str = CONTENT_COL,
                      case_sensitive: bool = False,
@@ -156,11 +216,9 @@ def filter_dataframe(df: pd.DataFrame, expr: str,
     haystack 可以传入 build_haystack 的结果复用, 省掉重复预处理.
     """
     expression = parse(expr)
-    if df is None or len(df) == 0:
-        return df.iloc[0:0] if df is not None else pd.DataFrame(), expression
-    hay = _resolve_haystack(df, content_col, case_sensitive, haystack)
-    mask = mask_from_haystack(hay, expression, case_sensitive=case_sensitive)
-    return df.loc[mask].copy(), expression
+    out = filter_by_expression(df, expression, content_col=content_col,
+                               case_sensitive=case_sensitive, haystack=haystack)
+    return out, expression
 
 
 def count_matches(df: pd.DataFrame, expr: str,
