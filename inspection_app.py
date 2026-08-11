@@ -36,10 +36,11 @@ def init_state() -> None:
     ss.setdefault("db", None)              # 整理好的 DataFrame
     ss.setdefault("read_results", [])      # 每个文件的解析诊断
     ss.setdefault("collect_warnings", [])
-    ss.setdefault("filtered", None)        # 筛选结果
     ss.setdefault("filter_expr_desc", "")
     ss.setdefault("keywords", [])           # 统计清单里的显示名
-    ss.setdefault("kw_exprs", {})            # 显示名 -> 实际表达式
+    # 显示名 -> {"expr": 表达式, "plants": 该条目自己的厂区范围}
+    # 每条自带厂区, 才能在同一张图里比较 TJ4的阀门 与 TJ3的阀门
+    ss.setdefault("kw_entries", {})
     ss.setdefault("chart_counts", None)      # 统计结果 DataFrame
     ss.setdefault("case_sensitive", False)
     ss.setdefault("loaded_from_disk", False)
@@ -47,7 +48,6 @@ def init_state() -> None:
     ss.setdefault("_scope_cache", {})   # 范围键 -> (子集, 搜索数组)
     ss.setdefault("_count_cache", {})   # (表达式, token) -> 命中数
     ss.setdefault("filter_levels", [""])     # 多级筛选: 每级一个表达式
-    ss.setdefault("filtered_levels_used", [])
 
     # 首次进入时自动读取上一次保存的数据库
     if ss.db is None and not ss.loaded_from_disk:
@@ -124,13 +124,39 @@ def cached_count(expr: str, plants: list[str]) -> int:
     return cache[key]
 
 
-def kw_expression(name: str) -> str:
-    """显示名对应的实际表达式 (直接输入的关键词两者相同)."""
-    return st.session_state.kw_exprs.get(name, name)
+def scope_label(plants: list[str]) -> str:
+    """厂区范围的中文说明."""
+    return "全部厂区" if not plants else "+".join(plants)
 
 
-def add_keyword(name: str, expr: str) -> tuple[bool, str]:
-    """加入统计清单. 返回 (是否成功, 提示)."""
+def prefixed_name(plants: list[str], base: str) -> str:
+    """给名称加厂区前缀; 全部厂区时不加, 保持名称简洁."""
+    base = str(base).strip()
+    return base if not plants else f"【{scope_label(plants)}】{base}"
+
+
+def kw_entry(name: str) -> dict:
+    """显示名对应的 {expr, plants}; 兼容只存了表达式的老状态."""
+    entry = st.session_state.kw_entries.get(name)
+    if isinstance(entry, dict):
+        return {"expr": entry.get("expr", name),
+                "plants": list(entry.get("plants") or [])}
+    return {"expr": name, "plants": []}
+
+
+def entry_count(name: str) -> int:
+    e = kw_entry(name)
+    return cached_count(e["expr"], e["plants"])
+
+
+def entry_total(name: str) -> int:
+    """该条目自身厂区范围内的总条数 (用来算占比)."""
+    sub, _ = get_scope(kw_entry(name)["plants"])
+    return len(sub) if sub is not None else 0
+
+
+def add_keyword(name: str, expr: str, plants: list[str]) -> tuple[bool, str]:
+    """加入统计清单; 每条自带厂区范围. 返回 (是否成功, 提示)."""
     name = str(name).strip()
     expr = query.normalize(expr)
     if not name or not expr:
@@ -138,7 +164,7 @@ def add_keyword(name: str, expr: str) -> tuple[bool, str]:
     if name in st.session_state.keywords:
         return False, f"「{name}」已在清单中。"
     st.session_state.keywords.append(name)
-    st.session_state.kw_exprs[name] = expr
+    st.session_state.kw_entries[name] = {"expr": expr, "plants": list(plants)}
     st.session_state[kw_key(name)] = True
     return True, f"已加入「{name}」。"
 
@@ -263,7 +289,6 @@ with st.sidebar:
     st.divider()
     if st.button("🗑 清空数据库", width="stretch"):
         set_db(None)
-        st.session_state.filtered = None
         st.session_state.chart_counts = None
         st.session_state.read_results = []
         if DB_PATH.exists():
@@ -382,7 +407,6 @@ with tab1:
             final = database.build_dataframe(raw, dedupe_rows=dedupe_rows)
             set_db(final)
             st.session_state.read_results = results
-            st.session_state.filtered = None
             st.session_state.chart_counts = None
             try:
                 database.save(final, DB_PATH)
@@ -489,8 +513,9 @@ with tab2:
             help="只在选中的厂区里筛选。",
         )
         scope_df, scope_hay = get_scope(sel_plants)
-        scope_label = "全部厂区" if not sel_plants else "、".join(sel_plants)
-        st.caption(f"当前范围：**{scope_label}**，共 {len(scope_df):,} 条")
+        cur_scope = scope_label(sel_plants)
+        st.caption(f"当前范围：**{cur_scope}**，共 {len(scope_df):,} 条"
+                   "　·　改动厂区或关键词后结果会自动更新")
 
         # ---- 多级筛选输入 ----
         levels = st.session_state.filter_levels
@@ -514,33 +539,32 @@ with tab2:
             st.rerun()
         if b2.button("↺ 重置层级", width="stretch"):
             st.session_state.filter_levels = [""]
-            st.session_state.filtered = None
             st.rerun()
-        do_filter = b3.button("🔍 筛选", type="primary")
+        b3.button("🔍 筛选", type="primary",
+                  help="结果本来就会随输入自动更新，这个按钮只是手动刷新一次。")
 
-        if do_filter:
+        # 结果直接由「当前层级 + 当前厂区」推导, 不缓存上一次点按钮的结果 ——
+        # 否则换了厂区之后页面上还是旧数据, 名字和数字会对不上.
+        sub = None
+        used: list[str] = []
+        if any(str(x).strip() for x in levels):
             try:
                 expression = query.combine_levels(levels)
                 sub = query.filter_by_expression(
                     scope_df, expression,
                     case_sensitive=st.session_state.case_sensitive,
                     haystack=scope_hay)
-                st.session_state.filtered = sub
+                used = [query.normalize(x) for x in levels if str(x).strip()]
                 st.session_state.filter_expr_desc = expression.describe()
-                st.session_state.filter_expr_raw = expression.raw
                 st.session_state.filter_expr_flat = query.format_expression(expression)
-                st.session_state.filtered_levels_used = [
-                    query.normalize(x) for x in levels if str(x).strip()]
-                st.session_state.filtered_plants = list(sel_plants)
             except query.EmptyExpression as exc:
-                st.session_state.filtered = None
                 st.error(str(exc))
+        else:
+            st.info("在上面填入第 1 级关键词即可开始筛选。")
 
-        sub = st.session_state.filtered
         if sub is not None:
             total = len(scope_df)
             n = len(sub)
-            used = st.session_state.filtered_levels_used
             c1, c2, c3 = st.columns([1, 1, 3])
             c1.metric("命中条目总数", f"{n:,}")
             c2.metric("占当前范围比例", f"{(n / total * 100 if total else 0):.2f}%")
@@ -560,15 +584,15 @@ with tab2:
                 st.dataframe(sub[keep].head(PREVIEW_ROWS), hide_index=True,
                              width="stretch", height=420)
 
-                raw_name = st.session_state.get("filter_expr_raw", "")
-                safe = "".join(ch for ch in raw_name
-                               if ch not in r'\/:*?"<>|') [:40] or "筛选"
-                used_plants = st.session_state.get("filtered_plants") or []
+                base_name = " → ".join(used)
+                default_name = prefixed_name(sel_plants, base_name)
+                safe = "".join(ch for ch in default_name
+                               if ch not in r'\/:*?"<>|')[:40] or "筛选"
                 cond_sheet = {"筛选条件": pd.DataFrame([{
-                    "筛选层级": " → ".join(used),
+                    "筛选层级": base_name,
                     "等价表达式": st.session_state.get("filter_expr_flat", ""),
                     "条件解释": st.session_state.filter_expr_desc,
-                    "厂区范围": "全部厂区" if not used_plants else "、".join(used_plants),
+                    "厂区范围": cur_scope,
                     "命中条目数": n,
                     "范围内总条目数": total,
                 }])}
@@ -580,7 +604,7 @@ with tab2:
                             sub, tuple(keep), cond_sheet,
                             (st.session_state.db_version,
                              st.session_state.get("filter_expr_flat", ""),
-                             scope_key(used_plants), n)),
+                             scope_key(sel_plants), n)),
                         file_name=f"筛选_{safe}_{n}条_{timestamp()}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         type="primary", width="stretch",
@@ -589,7 +613,10 @@ with tab2:
                 # ---- 把筛选结果加进统计清单 ----
                 st.divider()
                 st.markdown("**把这个筛选结果加入「③ 关键词统计」清单**")
-                default_name = " → ".join(used) if used else "筛选结果"
+                st.caption(
+                    f"将以 **{cur_scope}** 的范围加入，"
+                    "所以可以再换个厂区加一条，用来做跨厂区对比。"
+                )
                 f1, f2 = st.columns([3, 1])
                 with f1:
                     new_name = st.text_input(
@@ -601,11 +628,12 @@ with tab2:
                     if st.button("➕ 加入统计清单", width="stretch"):
                         ok, msg = add_keyword(
                             new_name.strip() or default_name,
-                            st.session_state.get("filter_expr_flat", ""))
+                            st.session_state.get("filter_expr_flat", ""),
+                            list(sel_plants))
                         (st.success if ok else st.warning)(msg)
                 st.caption(
+                    f"默认名称：`{default_name}`　·　"
                     f"等价表达式：`{st.session_state.get('filter_expr_flat', '')}`"
-                    "　（统计清单按这个表达式计数，与厂区选择相互独立）"
                 )
 
 
@@ -615,31 +643,53 @@ with tab3:
     if db is None or not len(db):
         st.info("请先在「① 数据汇总」里整理出数据。")
     else:
+        st.subheader("新增关键词")
         stat_plants = st.multiselect(
             "厂区（不选=全部厂区）", options=plant_options(), default=[],
-            key="stat_plants", help="统计与图表只统计选中厂区的数据。",
+            key="stat_plants",
+            help="这里选的厂区只作用于**新加入**的关键词；"
+                 "清单里已有的条目各自记着自己的厂区，不会被改动。",
         )
         stat_df, stat_hay = get_scope(stat_plants)
-        stat_scope_label = "全部厂区" if not stat_plants else "、".join(stat_plants)
-        st.caption(f"当前范围：**{stat_scope_label}**，共 {len(stat_df):,} 条")
+        add_scope = scope_label(stat_plants)
+        st.caption(f"新增时使用的范围：**{add_scope}**，共 {len(stat_df):,} 条")
 
-        st.subheader("关键词清单")
-        st.caption("同样支持 `&` 与 `|`，例如 `静电&接地`、`气味|扩散`；"
-                   "「② 关键词筛选」里的多级结果也可以直接加进来。")
+        per_plant = st.checkbox(
+            "为选中的每个厂区分别加一条（用于跨厂区对比）",
+            value=False, disabled=len(stat_plants) < 2,
+            help="例如选中 TJ3 与 TJ4 后输入「阀门」，会得到"
+                 "【TJ3】阀门 和【TJ4】阀门 两条，可在同一张图里比较。",
+        )
 
         with st.form("add_kw_form", clear_on_submit=True):
-            fa, fb = st.columns([4, 1])
+            fa, fb, fc = st.columns([1.1, 3.2, 1])
             with fa:
+                st.markdown(
+                    f"<div style='padding-top:6px;font-weight:600'>"
+                    f"【{add_scope}】</div>", unsafe_allow_html=True)
+            with fb:
                 new_kw = st.text_input("关键词", value="", label_visibility="collapsed",
                                         placeholder="输入关键词后点「添加」，或直接按回车")
-            with fb:
+            with fc:
                 added = st.form_submit_button("➕ 添加", width="stretch")
         if added:
             kw = query.normalize(new_kw)
-            ok, msg = add_keyword(kw, kw)
-            if ok:
-                st.rerun()
-            st.warning(msg)
+            if not kw:
+                st.warning("关键词不能为空。")
+            else:
+                targets = ([[pl] for pl in stat_plants]
+                           if per_plant and len(stat_plants) >= 2
+                           else [list(stat_plants)])
+                msgs, any_ok = [], False
+                for plants in targets:
+                    ok, msg = add_keyword(prefixed_name(plants, kw), kw, plants)
+                    any_ok = any_ok or ok
+                    if not ok:
+                        msgs.append(msg)
+                if any_ok:
+                    st.rerun()
+                for m in msgs:
+                    st.warning(m)
 
         keywords = st.session_state.keywords
         if not keywords:
@@ -656,36 +706,38 @@ with tab3:
                 for kw in list(keywords):
                     st.session_state.pop(kw_key(kw), None)
                 st.session_state.keywords = []
-                st.session_state.kw_exprs = {}
+                st.session_state.kw_entries = {}
                 st.session_state.chart_counts = None
                 st.rerun()
 
-            st.markdown("**勾选要在图表中显示的关键词**")
-            head = st.columns([0.8, 3, 2.6, 1.4, 0.9])
+            st.markdown("**勾选要在图表中显示的关键词**（每条按自己的厂区统计）")
+            head = st.columns([0.7, 2.6, 1.3, 2.2, 1.2, 0.8])
             head[0].caption("显示")
             head[1].caption("名称")
-            head[2].caption("表达式")
-            head[3].caption(f"命中（{stat_scope_label}）")
-            head[4].caption("删除")
+            head[2].caption("厂区")
+            head[3].caption("表达式")
+            head[4].caption("命中条目数")
+            head[5].caption("删除")
 
             to_delete: str | None = None
             for kw in list(keywords):
-                row = st.columns([0.8, 3, 2.6, 1.4, 0.9])
+                row = st.columns([0.7, 2.6, 1.3, 2.2, 1.2, 0.8])
                 # 不传 value: 让 checkbox 自己以 kw_key(kw) 为唯一状态源
                 st.session_state.setdefault(kw_key(kw), True)
                 row[0].checkbox("显示", key=kw_key(kw),
                                 label_visibility="collapsed")
-                expr = kw_expression(kw)
+                entry = kw_entry(kw)
                 row[1].write(kw)
-                row[2].write("—" if expr == kw else f"`{expr}`")
-                row[3].write(f"{cached_count(expr, stat_plants):,}")
-                if row[4].button("🗑", key=f"kwdel::{kw}", help=f"删除「{kw}」"):
+                row[2].write(scope_label(entry["plants"]))
+                row[3].write("—" if entry["expr"] == kw else f"`{entry['expr']}`")
+                row[4].write(f"{entry_count(kw):,}")
+                if row[5].button("🗑", key=f"kwdel::{kw}", help=f"删除「{kw}」"):
                     to_delete = kw
 
             if to_delete is not None:
                 st.session_state.keywords = [
                     k for k in st.session_state.keywords if k != to_delete]
-                st.session_state.kw_exprs.pop(to_delete, None)
+                st.session_state.kw_entries.pop(to_delete, None)
                 st.session_state.pop(kw_key(to_delete), None)
                 st.session_state.chart_counts = None
                 st.rerun()
@@ -700,20 +752,20 @@ with tab3:
             show_values = g3.checkbox("在图上显示数值", value=True)
 
             if st.button("📊 生成图表", type="primary", disabled=not selected):
-                total_in_scope = max(1, len(stat_df))
                 counts = pd.DataFrame([{
                     "关键词": name,
-                    "条目数": cached_count(kw_expression(name), stat_plants),
+                    "厂区": scope_label(kw_entry(name)["plants"]),
+                    "条目数": entry_count(name),
+                    "该厂区总条目数": entry_total(name),
                 } for name in selected])
-                counts["占比"] = counts["条目数"] / total_in_scope
+                counts["占比"] = (counts["条目数"]
+                                / counts["该厂区总条目数"].clip(lower=1))
                 if sort_desc:
                     counts = counts.sort_values("条目数", ascending=False,
                                                  kind="mergesort").reset_index(drop=True)
                 st.session_state.chart_counts = counts
                 st.session_state.chart_type = chart_type
                 st.session_state.chart_show_values = show_values
-                st.session_state.chart_scope_label = stat_scope_label
-                st.session_state.chart_scope_total = len(stat_df)
 
             if not selected:
                 st.warning("请至少勾选一个关键词。")
@@ -723,25 +775,26 @@ with tab3:
                 fig = charts.make_chart(
                     counts,
                     chart_type=st.session_state.get("chart_type", chart_type),
-                    title=("关键词统计（"
-                           f"{st.session_state.get('chart_scope_label', '全部厂区')}"
-                           f"，共 {st.session_state.get('chart_scope_total', len(db)):,} 条）"),
+                    title="关键词统计（每条按自身厂区范围计数）",
                     show_values=st.session_state.get("chart_show_values", True),
                 )
                 st.plotly_chart(fig, width="stretch")
 
                 show = counts.copy()
                 show["占比"] = (show["占比"] * 100).map(lambda v: f"{v:.2f}%")
+                show = show.rename(columns={"占比": "占该厂区比例"})
                 st.dataframe(show, hide_index=True, width="stretch")
+                st.caption("「占该厂区比例」= 命中条目数 ÷ 该条目所属厂区的总条目数，"
+                           "所以不同厂区之间的比例也可以直接比较。")
 
                 st.markdown("**保存图表**")
                 # 图表签名: 内容不变就复用已生成的 PNG/HTML
                 fig_token = (
                     st.session_state.get("chart_type", chart_type),
                     st.session_state.get("chart_show_values", True),
-                    st.session_state.get("chart_scope_label", ""),
-                    st.session_state.get("chart_scope_total", 0),
-                    tuple(zip(counts["关键词"].tolist(), counts["条目数"].tolist())),
+                    tuple(zip(counts["关键词"].tolist(),
+                              counts["厂区"].tolist(),
+                              counts["条目数"].tolist())),
                 )
                 want_png = st.checkbox(
                     "准备高清 PNG（首次约 1 秒）", value=False,
