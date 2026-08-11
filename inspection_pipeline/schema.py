@@ -16,15 +16,17 @@
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
 # ---------- 输出数据库字段 ----------
 SEQ_COL = "序号"
 DATE_COL = "日期"
+PLANT_COL = "厂区"
 CONTENT_COL = "巡查发现"
 
-#: 用户要求的 3 个主字段 (导出默认只含这 3 列)
-CORE_COLUMNS: List[str] = [SEQ_COL, DATE_COL, CONTENT_COL]
+#: 导出默认包含的主字段
+CORE_COLUMNS: List[str] = [SEQ_COL, DATE_COL, PLANT_COL, CONTENT_COL]
 
 #: 内部额外保留的溯源字段 (导出时可选勾选)
 SOURCE_FILE_COL = "来源文件"
@@ -89,6 +91,43 @@ KNOWN_DATE_COLUMNS: List[str] = [
 DATE_COLUMN_BLOCKLIST: List[str] = [
     "创建时间", "修改时间", "复核日期", "整改时限", "反馈时间", "更新时间",
 ]
+
+
+# ---------- 厂区 ----------
+#: 认可的厂区代号
+PLANT_CODES: List[str] = [
+    "TJ1", "TJ2", "TJ3", "TJ4", "TJ6",
+    "FX1", "FX2",
+    "DH1", "DH2", "DH3",
+    "SH1", "SH2", "SH3", "SH4",
+]
+
+#: 没能归入上面任何一个代号时的标记 (不丢数据, 界面里也能筛)
+UNKNOWN_PLANT = "未识别"
+
+#: 厂区列候选. 按用户说明, 日常隐患排查以「整改厂区」为准;
+#: 其它台账用「厂区」. 组织厂区 只作为最后兜底.
+PLANT_COLUMN_PRIORITY: List[str] = ["整改厂区", "厂区", "组织厂区", "所属厂区"]
+
+# 代号后面不能紧跟数字, 否则 TJ10_CSBT 会被误当成 TJ1;
+# 后缀如 TJ4-CMMD / TJ4CMMD / TJ4_CSBT 都会归到 TJ4.
+_PLANT_RE = re.compile("(" + "|".join(PLANT_CODES) + r")(?!\d)", re.IGNORECASE)
+
+
+def normalize_plant(value: object) -> Optional[str]:
+    """从任意文本里提取厂区代号; 取最先出现的那个, 保证一条数据只对应一个厂区."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    m = _PLANT_RE.search(text)
+    return m.group(1).upper() if m else None
+
+
+def plant_from_filename(file_name: str) -> Optional[str]:
+    """文件名里出现厂区代号 -> 整个文件都算这个厂区."""
+    return normalize_plant(file_name)
 
 
 def detect_kind(file_name: str = "", sheet_name: str = "",

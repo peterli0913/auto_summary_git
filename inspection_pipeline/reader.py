@@ -16,8 +16,10 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 import pandas as pd
 
 from .schema import (CONTENT_COL, DATE_COL, DATE_COLUMN_BLOCKLIST, KIND_COL,
-                     Kind, SOURCE_FILE_COL, content_candidates,
-                     date_candidates, detect_kind)
+                     PLANT_COL, PLANT_COLUMN_PRIORITY, SOURCE_FILE_COL,
+                     UNKNOWN_PLANT, Kind, content_candidates,
+                     date_candidates, detect_kind, normalize_plant,
+                     plant_from_filename)
 
 #: 依次尝试的表头行号
 HEADER_CANDIDATES: Tuple[int, ...] = (1, 0, 2)
@@ -58,9 +60,11 @@ class ReadResult:
     header_row: Optional[int] = None
     date_column: Optional[str] = None
     content_column: Optional[str] = None
+    plant_source: str = ""          # "文件名" / 具体列名 / "未识别"
     n_rows: int = 0
     n_valid: int = 0
     n_date_parsed: int = 0
+    n_plant_known: int = 0
     error: Optional[str] = None
     frame: Optional[pd.DataFrame] = field(default=None, repr=False)
 
@@ -145,6 +149,39 @@ def pick_date_column(df: pd.DataFrame, kind: str) -> Optional[str]:
 
 
 # ---------------- 巡查发现列 ----------------
+
+def pick_plant_column(df: pd.DataFrame) -> Optional[str]:
+    """选出厂区列: 按 整改厂区 > 厂区 > 组织厂区 的优先级."""
+    cols = [str(c).strip() for c in df.columns]
+    for name in PLANT_COLUMN_PRIORITY:
+        if name in cols and df[name].notna().any():
+            return name
+    return None
+
+
+def resolve_plants(df: pd.DataFrame, file_name: str) -> Tuple[pd.Series, str]:
+    """给每行定一个厂区, 返回 (厂区列, 判定依据说明).
+
+    优先级按用户要求:
+      1. 文件名里出现厂区代号 -> 整个文件都算该厂区
+      2. 否则看内容里的厂区列 (整改厂区 > 厂区 > 组织厂区)
+    识别不出来的记成 "未识别", 不丢数据.
+    """
+    from_name = plant_from_filename(file_name)
+    if from_name:
+        return pd.Series([from_name] * len(df), index=df.index), "文件名"
+
+    column = pick_plant_column(df)
+    if column is None:
+        return pd.Series([UNKNOWN_PLANT] * len(df), index=df.index), UNKNOWN_PLANT
+
+    # 同一列里重复值很多, 先按唯一值算一遍再映射回去
+    raw = df[column].astype("string")
+    mapping = {v: (normalize_plant(v) or UNKNOWN_PLANT)
+               for v in raw.dropna().unique()}
+    plants = raw.map(mapping).fillna(UNKNOWN_PLANT)
+    return plants, column
+
 
 def pick_content_column(df: pd.DataFrame, kind: str) -> Optional[str]:
     """选出 "巡查发现" 列: 先按已知列名, 再兜底选平均文本最长的一列."""
@@ -283,9 +320,12 @@ def read_inspection_excel(source: Union[str, Path, io.BytesIO, bytes],
         content = df[content_col].astype("string").str.strip()
         dates = (parse_date_series(df[date_col]) if date_col
                  else pd.Series([pd.NaT] * len(df), index=df.index))
+        plants, plant_source = resolve_plants(df, file_name)
+        result.plant_source = plant_source
 
         out = pd.DataFrame({
             DATE_COL: dates.values,
+            PLANT_COL: plants.values,
             CONTENT_COL: content.values,
             SOURCE_FILE_COL: file_name,
             KIND_COL: result.kind,
@@ -297,6 +337,7 @@ def read_inspection_excel(source: Union[str, Path, io.BytesIO, bytes],
         result.frame = out
         result.n_valid = len(out)
         result.n_date_parsed = int(out[DATE_COL].notna().sum())
+        result.n_plant_known = int((out[PLANT_COL] != UNKNOWN_PLANT).sum())
         return result
 
     except Exception as exc:  # noqa: BLE001 - 单个坏文件不应中断整批
@@ -321,6 +362,6 @@ def read_many(sources: Sequence[Tuple[str, Union[str, Path, bytes, io.BytesIO]]]
     if frames:
         merged = pd.concat(frames, ignore_index=True)
     else:
-        from .schema import ALL_COLUMNS
-        merged = pd.DataFrame(columns=[c for c in ALL_COLUMNS if c != "序号"])
+        merged = pd.DataFrame(columns=[DATE_COL, PLANT_COL, CONTENT_COL,
+                                       SOURCE_FILE_COL, KIND_COL])
     return merged, results
