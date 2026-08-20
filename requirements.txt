@@ -1,0 +1,14 @@
+streamlit>=1.40
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+xlsxwriter>=3.2
+
+# Excel 读取加速: Rust 实现, 比 openpyxl 快 4 倍以上.
+# 装不上也能跑, reader 会自动回退到 openpyxl.
+python-calamine>=0.2
+plotly>=5.20
+
+# 保存图表为 PNG 用. 若部署环境装不上, 应用会自动降级成
+# 「保存为 HTML」+ 图表右上角相机按钮, 功能不受影响.
+kaleido>=0.2
