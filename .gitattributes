@@ -1,2 +1,3 @@
-# .bat 必须是 CRLF, 否则 Windows 的 cmd 在 goto/多行块上可能出错
-*.bat text eol=crlf
+# .bat 用 GBK 编码 + CRLF: 中文 Windows 控制台默认是 936 代码页,
+# 存成 UTF-8 会显示乱码. 标成 -text 让 git 原样保存, 不做任何换行/编码转换.
+*.bat -text
