@@ -20,6 +20,27 @@ Excel（多文件 / 整个文件夹 / ZIP） ──▶ 序号 · 日期 · 巡�
 
 ## 快速开始
 
+### Windows：双击 `启动巡查分析.bat`
+
+把项目文件夹放到本机任意位置，**双击 `启动巡查分析.bat`** 即可，它会自动：
+
+1. 切到脚本所在目录（所以从哪儿双击都行）
+2. 找 Python（先试 `python`，再试 `py -3`）
+3. 装依赖 —— 只在**缺包**或 `requirements.txt` 有改动时才装，平时直接跳过
+4. 选端口（8501 被别的程序占用就自动往后找）
+5. 启动服务，等健康检查通过后**自动打开浏览器**（只开一个标签页）
+
+关掉那个黑色命令行窗口，或在里面按 `Ctrl+C`，就停止程序。
+
+几个细节：
+
+- 如果 8501 上**已经**跑着本程序，脚本不会再开第二个，只把浏览器打开
+- `python-calamine` / `kaleido` 装不上不会导致启动失败 —— 它们只是加速和出图组件，
+  程序会自动降级，脚本也会在启动时告诉你装没装上
+- 没装 Python 或装依赖失败时，窗口会停住并给出具体的处理办法，不会一闪而过
+
+### 手动运行（macOS / Linux，或想自己控制）
+
 ```bash
 pip install -r requirements.txt
 streamlit run inspection_app.py
@@ -183,6 +204,7 @@ streamlit run inspection_app.py
 
 ```
 .
+├── 启动巡查分析.bat                # Windows 一键启动（双击即可）
 ├── inspection_app.py              # Streamlit 界面（三个功能页）
 ├── inspection_pipeline/
 │   ├── schema.py                  # 3 字段定义 + 各类台账列名映射

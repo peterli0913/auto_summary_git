@@ -9,6 +9,9 @@ env/
 # 运行时数据 (数据库 / 上传缓存 / 导出结果)
 data/
 
+# 启动脚本记录的依赖安装标记
+.deps_installed
+
 # Streamlit 本地 secrets
 .streamlit/secrets.toml
 

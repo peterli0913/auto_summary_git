@@ -1,0 +1,2 @@
+# .bat 必须是 CRLF, 否则 Windows 的 cmd 在 goto/多行块上可能出错
+*.bat text eol=crlf
