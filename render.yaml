@@ -1,0 +1,21 @@
+# Render Blueprint: 一键部署 Streamlit 隐患分类 App
+# 文档: https://render.com/docs/blueprint-spec
+#
+# 注意: 必须从分支 cursor/hazard-classifier-pipeline-3238 部署
+# (main 分支没有 app.py)
+
+services:
+  - type: web
+    name: hazard-classifier
+    runtime: python
+    plan: free
+    branch: cursor/hazard-classifier-pipeline-3238
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.3"
+      - key: STREAMLIT_SERVER_ENABLE_CORS
+        value: "false"
+      - key: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
+        value: "false"

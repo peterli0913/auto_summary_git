@@ -1,0 +1,1 @@
+{"other_threshold": 0.6799999999999999, "classes_positive_": ["化学品暴露", "跑冒滴漏", "静电事件"], "threshold_modes": {"strict": {"threshold": 0.9700000000000001, "pos_to_other": 0.0052173913043478265, "other_to_pos": 2172}, "balanced": {"threshold": 0.6799999999999999, "pos_to_other": 0.10695652173913044, "other_to_pos": 333, "accuracy": 0.908849221420433}}, "default_mode": "balanced"}
